@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.stock-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/gaga/stock-monitor/.venv/bin/python</string>
+        <string>/Users/gaga/stock-monitor/monitor.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/gaga/stock-monitor</string>
+
+    <!-- 每天 22:00 运行（美股收盘后约 30 分钟） -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>22</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/gaga/stock-monitor/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/gaga/stock-monitor/stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
