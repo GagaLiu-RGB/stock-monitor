@@ -6,3 +6,4 @@ server.log
 server.err.log
 charts/
 .DS_Store
+config.json
