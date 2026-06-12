@@ -404,12 +404,129 @@ def api_debug():
                 result[sym] = {"has_portfolio": has_pf, "portfolio": s.get("portfolio")}
     return jsonify(result)
 
+@app.route('/api/history')
+def api_history():
+    """Fetch extended OHLC history for a single symbol.
+    Params: symbol (required), days OR start+end dates.
+    """
+    symbol = request.args.get('symbol', '').strip()
+    if not symbol:
+        return jsonify({"error": "missing symbol"}), 400
+
+    days_param = request.args.get('days')
+    start_param = request.args.get('start')
+    end_param = request.args.get('end')
+
+    end_dt = datetime.now()
+    if start_param and end_param:
+        try:
+            start_dt = datetime.strptime(start_param, '%Y-%m-%d')
+            end_dt = datetime.strptime(end_param, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({"error": "invalid date format, use YYYY-MM-DD"}), 400
+    elif days_param:
+        try:
+            days = int(days_param)
+        except ValueError:
+            return jsonify({"error": "invalid days param"}), 400
+        start_dt = end_dt - timedelta(days=days + 10)
+    else:
+        return jsonify({"error": "provide days or start+end"}), 400
+
+    try:
+        df = yf.download(symbol, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if days_param:
+            days = int(days_param)
+            df = df.tail(days) if len(df) > days else df
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if df.empty:
+        return jsonify({"ohlc": [], "symbol": symbol})
+
+    df_clean = df.dropna(subset=['Close'])
+    ohlc = []
+    for i, row in df_clean.iterrows():
+        ohlc.append({
+            "date": i.strftime('%Y-%m-%d'),
+            "open": safe_float(row['Open']),
+            "high": safe_float(row['High']),
+            "low": safe_float(row['Low']),
+            "close": safe_float(row['Close']),
+            "volume": int(row['Volume']) if 'Volume' in row and pd.notna(row['Volume']) else 0,
+        })
+
+    return jsonify({"ohlc": ohlc, "symbol": symbol})
+
 @app.route('/api/refresh')
 def api_refresh():
     """Force refresh, ignore cache TTL."""
     t = threading.Thread(target=ensure_data, args=(True,), daemon=True)
     t.start()
     return jsonify({"status": "refreshing"})
+
+def build_single_stock(sym, label):
+    """Build complete card data for a single stock (used by add-stock API)."""
+    df = fetch_yf(sym)
+    if df.empty:
+        return {"symbol": sym, "label": label, "error": True}
+    df_clean = df.dropna(subset=['Close'])
+    if df_clean.empty:
+        return {"symbol": sym, "label": label, "error": True}
+
+    close = df_clean['Close'].values
+    ohlc = []
+    for i, row in df_clean.iterrows():
+        ohlc.append({
+            "date": i.strftime('%Y-%m-%d'),
+            "open": safe_float(row['Open']),
+            "high": safe_float(row['High']),
+            "low": safe_float(row['Low']),
+            "close": safe_float(row['Close']),
+            "volume": int(row['Volume']) if 'Volume' in row and pd.notna(row['Volume']) else 0,
+        })
+
+    last_ohlc_date = df_clean.index[-1].strftime('%m/%d')
+    rt_price, rt_prev = fetch_realtime_price(sym)
+    if rt_price is not None:
+        last = rt_price
+        prev = rt_prev if rt_prev is not None else (float(close[-2]) if len(close) > 1 else last)
+    else:
+        last = float(close[-1])
+        prev = float(close[-2]) if len(close) > 1 else last
+
+    change = last - prev
+    change_pct = (change / prev) * 100 if prev else 0
+
+    entry = {
+        "symbol": sym, "label": label,
+        "price": safe_float(last),
+        "change": safe_float(change),
+        "changePct": safe_float(change_pct),
+        "high90": safe_float(df_clean['High'].max()),
+        "low90": safe_float(df_clean['Low'].min()),
+        "ohlc": ohlc,
+        "dataDate": last_ohlc_date,
+        "isRealtime": rt_price is not None,
+    }
+
+    pf = PORTFOLIO.get(sym)
+    if pf and "shares" in pf and "cost" in pf:
+        shares_val, cost_val = pf["shares"], pf["cost"]
+        mkt_val = last * shares_val
+        pnl = (last - cost_val) * shares_val
+        pnl_pct = (last - cost_val) / cost_val * 100 if cost_val else 0
+        entry["portfolio"] = {
+            "type": "stock", "shares": shares_val,
+            "cost": round(cost_val, 3),
+            "mktVal": safe_float(mkt_val),
+            "pnl": safe_float(pnl),
+            "pnlPct": safe_float(pnl_pct),
+        }
+
+    return entry
 
 @app.route('/api/add-stock', methods=['POST'])
 def api_add_stock():
@@ -423,6 +540,9 @@ def api_add_stock():
     cost = d.get('cost')
     if not symbol or not label:
         return jsonify({"error": "代码和名称不能为空"}), 400
+
+    if symbol.endswith('.US'):
+        symbol = symbol[:-3]
 
     suffix_map = {"A股": ".SZ", "港股": ".HK"}
     if market in suffix_map and not any(symbol.endswith(s) for s in ['.SZ','.SS','.HK']):
@@ -449,6 +569,13 @@ def api_add_stock():
             if s[0] == symbol:
                 return jsonify({"error": f"{symbol} 已存在"}), 400
 
+    try:
+        test_price, _ = fetch_realtime_price(symbol)
+        if test_price is None:
+            return jsonify({"error": f"无法获取 {symbol} 的行情数据，请检查代码是否正确"}), 400
+    except Exception:
+        return jsonify({"error": f"验证 {symbol} 失败，请检查代码是否正确"}), 400
+
     TABS[tab_name][grp_name].append((symbol, label))
 
     if shares is not None and cost is not None:
@@ -458,10 +585,13 @@ def api_add_stock():
             pass
 
     save_config(TABS, PORTFOLIO, TAB_CURRENCY)
+
+    stock_entry = build_single_stock(symbol, label)
+
     cache["updated_ts"] = 0
     t = threading.Thread(target=ensure_data, args=(True,), daemon=True)
     t.start()
-    return jsonify({"ok": True, "symbol": symbol, "tab": tab_name, "group": grp_name})
+    return jsonify({"ok": True, "symbol": symbol, "tab": tab_name, "group": grp_name, "stock": stock_entry})
 
 @app.route('/api/remove-stock', methods=['POST'])
 def api_remove_stock():
@@ -550,6 +680,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
     display: flex; align-items: center; gap: 16px;
     padding: 16px 24px; border-bottom: 1px solid var(--border);
     position: sticky; top: 0; background: var(--bg); z-index: 100;
+    flex-wrap: wrap;
   }
   .top-bar h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: #e8ecf4; white-space: nowrap; }
   .top-bar .date { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
@@ -575,7 +706,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
     cursor: pointer; transition: all 0.15s;
   }
   .mode-toggle button.active { background: #2a2a3a; color: #e0e4f0; }
-  .legend { display: flex; gap: 14px; font-size: 11px; color: var(--text-dim); margin-left: 8px; }
+  .legend { display: flex; gap: 14px; font-size: 11px; color: var(--text-dim); }
   .legend span { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
   .legend .dot { width: 14px; height: 2px; border-radius: 1px; display: inline-block; }
   .content { padding: 8px 24px 32px; }
@@ -642,7 +773,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
   .portfolio .pf-delay { font-size: 9px; opacity: 0.45; font-weight: 400; margin-left: 4px; }
   .period-toggle {
     display: flex; gap: 2px; background: #16161f;
-    border-radius: 8px; padding: 3px;
+    border-radius: 8px; padding: 3px; flex-wrap: wrap;
   }
   .period-toggle button {
     background: none; border: none; color: var(--text-dim);
@@ -650,6 +781,27 @@ HTML_PAGE = r'''<!DOCTYPE html>
     cursor: pointer; transition: all 0.15s;
   }
   .period-toggle button.active { background: #2a2a3a; color: #e0e4f0; }
+  .period-toggle button.custom-active { background: var(--accent); color: #fff; }
+  .custom-range-picker {
+    display: none; align-items: center; gap: 8px;
+    margin-top: 6px; padding: 8px 12px;
+    background: #16161f; border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .custom-range-picker.show { display: flex; flex-wrap: wrap; flex-basis: 100%; }
+  .custom-range-picker label { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+  .custom-range-picker input[type="date"] {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 12px;
+    padding: 4px 8px; outline: none; transition: border-color 0.15s;
+  }
+  .custom-range-picker input[type="date"]:focus { border-color: var(--accent); }
+  .custom-range-picker .apply-btn {
+    background: var(--accent); color: #fff; border: none;
+    border-radius: 6px; font-size: 11px; padding: 5px 12px;
+    cursor: pointer; font-weight: 500; transition: opacity 0.15s;
+  }
+  .custom-range-picker .apply-btn:hover { opacity: 0.85; }
   .recommendation {
     display: flex; align-items: center; gap: 8px;
     margin-top: 8px; padding: 7px 10px;
@@ -819,11 +971,49 @@ HTML_PAGE = r'''<!DOCTYPE html>
   .edit-modal .action-tab.sell.active { border-color: var(--down); color: var(--down); background: rgba(34,197,94,0.08); }
   .news-title-zh { font-size: 12px; color: var(--text-dim); margin-top: 3px; line-height: 1.4; }
 
+  /* ── Nav sections & dividers ── */
+  .nav-section { display: flex; align-items: center; gap: 6px; }
+  .nav-label {
+    font-size: 10px; color: var(--text-dim); opacity: 0.6;
+    letter-spacing: 0.06em; white-space: nowrap;
+  }
+  .nav-divider {
+    width: 1px; height: 24px; background: #2a2a3a;
+    margin: 0 4px; flex-shrink: 0;
+  }
+  .period-more { position: relative; }
+  .period-more-btn {
+    background: none; border: none; color: var(--text-dim);
+    font-size: 12px; padding: 4px 10px; border-radius: 6px;
+    cursor: pointer; transition: all 0.15s; white-space: nowrap;
+  }
+  .period-more-btn.active { background: #2a2a3a; color: #e0e4f0; }
+  .period-more-btn.custom-active { background: var(--accent); color: #fff; }
+  .period-dropdown {
+    display: none; position: absolute; top: calc(100% + 4px); left: 50%;
+    transform: translateX(-50%);
+    background: #1a1a26; border: 1px solid var(--border);
+    border-radius: 8px; padding: 4px; z-index: 200;
+    min-width: 100px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  .period-more:hover .period-dropdown { display: flex; flex-direction: column; }
+  .period-dropdown button {
+    background: none; border: none; color: var(--text-dim);
+    font-size: 12px; padding: 6px 14px; border-radius: 6px;
+    cursor: pointer; transition: all 0.15s; text-align: left;
+    white-space: nowrap;
+  }
+  .period-dropdown button:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+  .period-dropdown button.active { color: var(--accent); }
+
   @media (max-width: 820px) {
     .grid { grid-template-columns: 1fr; }
     .content { padding: 8px 14px 24px; }
-    .top-bar { padding: 12px 14px; flex-wrap: wrap; }
-    .controls { width: 100%; justify-content: space-between; margin-left: 0; margin-top: 8px; }
+    .top-bar { padding: 12px 14px; }
+    .controls { width: 100%; justify-content: flex-start; flex-wrap: wrap; margin-left: 0; margin-top: 8px; gap: 6px; }
+    .nav-divider { height: 20px; }
+    .nav-label { display: none; }
   }
 </style>
 </head>
@@ -833,23 +1023,57 @@ HTML_PAGE = r'''<!DOCTYPE html>
   <h1>Stock Monitor</h1>
   <span class="date"><span id="updateTime">加载中...</span></span>
   <div class="controls">
-    <div class="tab-bar" id="tabBar"></div>
-    <div class="period-toggle" id="periodBar">
-      <button onclick="setPeriod(1)">当日</button>
-      <button onclick="setPeriod(7)">7日</button>
-      <button onclick="setPeriod(30)">30日</button>
-      <button onclick="setPeriod(60)">60日</button>
-      <button class="active" onclick="setPeriod(90)">90日</button>
+    <div class="nav-section">
+      <span class="nav-label">标签</span>
+      <div class="tab-bar" id="tabBar"></div>
     </div>
-    <div class="mode-toggle">
-      <button class="active" onclick="setMode('line')">曲线</button>
-      <button onclick="setMode('candle')">K线</button>
+    <div class="nav-divider"></div>
+    <div class="nav-section">
+      <span class="nav-label">周期</span>
+      <div class="period-toggle" id="periodBar">
+        <button onclick="setPeriod(1)">当日</button>
+        <button onclick="setPeriod(7)">7日</button>
+        <div class="period-more">
+          <button class="period-more-btn active" id="moreBtn">90日 ▾</button>
+          <div class="period-dropdown" id="periodDropdown">
+            <button onclick="setPeriodFromMore(30)">30日</button>
+            <button onclick="setPeriodFromMore(60)">60日</button>
+            <button class="active" onclick="setPeriodFromMore(90)">90日</button>
+            <button onclick="setPeriodFromMore(180)">180日</button>
+            <button onclick="setPeriodFromMore(365)">1年</button>
+            <button onclick="setPeriodFromMore(730)">2年</button>
+            <button onclick="setPeriodFromMore(1095)">3年</button>
+            <button onclick="setPeriodFromMore(1825)">5年</button>
+            <button onclick="setPeriodFromMore(9999)">Max</button>
+            <button onclick="toggleCustomRange()" id="customBtn">自定义</button>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="legend">
-      <span><i class="dot" style="background:var(--accent)"></i>实际价格</span>
-      <span><i class="dot" style="background:var(--ma5)"></i>5日均线</span>
-      <span><i class="dot" style="background:var(--ma20)"></i>20日均线</span>
+    <div class="nav-divider"></div>
+    <div class="nav-section">
+      <span class="nav-label">图表</span>
+      <div class="mode-toggle">
+        <button class="active" onclick="setMode('line')">曲线</button>
+        <button onclick="setMode('candle')">K线</button>
+      </div>
     </div>
+    <div class="nav-divider"></div>
+    <div class="nav-section">
+      <span class="nav-label">图例</span>
+      <div class="legend">
+        <span><i class="dot" style="background:var(--accent)"></i>实际价格</span>
+        <span><i class="dot" style="background:var(--ma5)"></i>5日均线</span>
+        <span><i class="dot" style="background:var(--ma20)"></i>20日均线</span>
+      </div>
+    </div>
+  </div>
+  <div class="custom-range-picker" id="customRangePicker">
+    <label>从</label>
+    <input type="date" id="customStart">
+    <label>至</label>
+    <input type="date" id="customEnd">
+    <button class="apply-btn" onclick="applyCustomRange()">应用</button>
   </div>
 </div>
 
@@ -920,26 +1144,142 @@ let tabNames = [];
 let activeTab = '资讯';
 let currentMode = 'line';
 let currentPeriod = 90;
-const PERIOD_LABELS = {1:'当日',7:'7日',30:'30日',60:'60日',90:'90日'};
+let customDateRange = null; // {start, end} when custom range is active
+const PERIOD_LABELS = {1:'当日',7:'7日',30:'30日',60:'60日',90:'90日',180:'180日',365:'1年',730:'2年',1095:'3年',1825:'5年',9999:'Max'};
 let chartInstances = [];
 const chartMap = {};
+let extendedOhlcCache = {}; // {symbol: {days: ohlcArray}}
 
 function setPeriod(days) {
   currentPeriod = days;
-  document.querySelectorAll('.period-toggle button').forEach(b => {
+  customDateRange = null;
+  document.getElementById('customRangePicker').classList.remove('show');
+  document.querySelectorAll('#periodBar > button').forEach(b => {
+    b.classList.remove('active');
+    if (b.textContent === PERIOD_LABELS[days]) b.classList.add('active');
+  });
+  const moreBtn = document.getElementById('moreBtn');
+  moreBtn.textContent = '更多 ▾';
+  moreBtn.classList.remove('active', 'custom-active');
+  document.querySelectorAll('#periodDropdown button').forEach(b => b.classList.remove('active'));
+  destroyCharts();
+  if (days > 90) {
+    fetchExtendedAndRender(days);
+  } else {
+    renderTab();
+  }
+}
+
+function setPeriodFromMore(days) {
+  currentPeriod = days;
+  customDateRange = null;
+  document.getElementById('customRangePicker').classList.remove('show');
+  document.querySelectorAll('#periodBar > button').forEach(b => b.classList.remove('active'));
+  const moreBtn = document.getElementById('moreBtn');
+  moreBtn.textContent = (PERIOD_LABELS[days] || days+'日') + ' ▾';
+  moreBtn.classList.add('active');
+  moreBtn.classList.remove('custom-active');
+  document.querySelectorAll('#periodDropdown button').forEach(b => {
     b.classList.toggle('active', b.textContent === PERIOD_LABELS[days]);
   });
   destroyCharts();
+  if (days > 90) {
+    fetchExtendedAndRender(days);
+  } else {
+    renderTab();
+  }
+}
+
+function toggleCustomRange() {
+  const picker = document.getElementById('customRangePicker');
+  const btn = document.getElementById('customBtn');
+  const showing = picker.classList.toggle('show');
+  if (showing) {
+    const today = new Date().toISOString().slice(0, 10);
+    const oneYearAgo = new Date(Date.now() - 365*86400000).toISOString().slice(0, 10);
+    if (!document.getElementById('customEnd').value) document.getElementById('customEnd').value = today;
+    if (!document.getElementById('customStart').value) document.getElementById('customStart').value = oneYearAgo;
+  }
+}
+
+function applyCustomRange() {
+  const start = document.getElementById('customStart').value;
+  const end = document.getElementById('customEnd').value;
+  if (!start || !end) return;
+  if (start >= end) { alert('开始日期必须早于结束日期'); return; }
+  customDateRange = { start, end };
+  currentPeriod = 'custom';
+  document.querySelectorAll('#periodBar > button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('#periodDropdown button').forEach(b => {
+    b.classList.toggle('active', b.id === 'customBtn');
+  });
+  const moreBtn = document.getElementById('moreBtn');
+  moreBtn.textContent = '自定义 ▾';
+  moreBtn.classList.remove('active');
+  moreBtn.classList.add('custom-active');
+  destroyCharts();
+  fetchExtendedAndRender(null, start, end);
+}
+
+async function fetchExtendedAndRender(days, start, end) {
+  const tabData = TABS_DATA[activeTab];
+  if (!tabData || activeTab === '资讯') { renderTab(); return; }
+  const groups = tabData.groups || {};
+  const symbols = [];
+  for (const stocks of Object.values(groups)) {
+    for (const s of stocks) {
+      if (!s.error) symbols.push(s.symbol);
+    }
+  }
+
+  const fetches = symbols.map(async sym => {
+    const cacheKey = days ? `${sym}_${days}` : `${sym}_${start}_${end}`;
+    if (extendedOhlcCache[cacheKey]) return;
+    let url = `/api/history?symbol=${encodeURIComponent(sym)}`;
+    if (days) url += `&days=${days}`;
+    else url += `&start=${start}&end=${end}`;
+    try {
+      const resp = await fetch(url);
+      const json = await resp.json();
+      if (json.ohlc) extendedOhlcCache[cacheKey] = json.ohlc;
+    } catch(e) { console.error('History fetch failed:', sym, e); }
+  });
+
+  await Promise.all(fetches);
   renderTab();
 }
 
-function getPeriodData(ohlc, calendarDays, realPrice) {
+function getEffectiveOhlc(stock) {
+  if (customDateRange) {
+    const key = `${stock.symbol}_${customDateRange.start}_${customDateRange.end}`;
+    return extendedOhlcCache[key] || stock.ohlc;
+  }
+  if (currentPeriod > 90) {
+    const key = `${stock.symbol}_${currentPeriod}`;
+    return extendedOhlcCache[key] || stock.ohlc;
+  }
+  return stock.ohlc;
+}
+
+function getPeriodData(ohlc, calendarDays, realPrice, customRange) {
   if (!ohlc || ohlc.length === 0) return { changePct:0, high:0, low:0 };
   const now = realPrice || ohlc[ohlc.length-1].close;
+
+  if (customRange) {
+    const f = ohlc.filter(d => d.date >= customRange.start && d.date <= customRange.end);
+    if (f.length === 0) return { changePct:0, high:now, low:now };
+    const first = f[0].close;
+    return { changePct: first ? ((now-first)/first*100) : 0, high: Math.max(now, ...f.map(d=>d.high)), low: Math.min(now, ...f.map(d=>d.low)) };
+  }
+
   if (calendarDays <= 1) {
     const d = ohlc[ohlc.length - 1];
     const base = d.open || d.close;
     return { changePct: base ? ((now - base) / base * 100) : 0, high: Math.max(d.high, now), low: Math.min(d.low, now) };
+  }
+  if (calendarDays >= 9999) {
+    const first = ohlc[0].close;
+    return { changePct: first ? ((now-first)/first*100) : 0, high: Math.max(now, ...ohlc.map(d=>d.high)), low: Math.min(now, ...ohlc.map(d=>d.low)) };
   }
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - calendarDays);
@@ -1245,13 +1585,14 @@ function renderTab() {
       const sign = up ? '+' : '-';
       const safeSym = stock.symbol.replace(/[^a-zA-Z0-9]/g, '_');
 
-      const pd = getPeriodData(stock.ohlc, currentPeriod, stock.price);
-      const pdLabel = PERIOD_LABELS[currentPeriod];
+      const effectiveOhlc = getEffectiveOhlc(stock);
+      const pd = getPeriodData(effectiveOhlc, currentPeriod === 'custom' ? 0 : currentPeriod, stock.price, customDateRange);
+      const pdLabel = customDateRange ? '区间' : (PERIOD_LABELS[currentPeriod] || currentPeriod+'日');
       const pdUp = pd.changePct >= 0;
       const pdCls = pdUp ? 'up' : 'down';
       const pdSign = pdUp ? '+' : '-';
 
-      const rec = getRecommendation(stock.ohlc);
+      const rec = getRecommendation(effectiveOhlc);
       let recHtml = '';
       if (rec) {
         recHtml = `<div class="recommendation"><span class="rec-signal ${rec.cls}">${rec.signal}</span><span class="rec-reason">${rec.reason}</span></div>`;
@@ -1297,9 +1638,10 @@ function renderTab() {
         ${pfHtml}
       `;
       grid.appendChild(card);
+      const chartStock = Object.assign({}, stock, { ohlc: effectiveOhlc });
       requestAnimationFrame(() => {
         const el = document.getElementById('chart-' + safeSym);
-        if (el) createChart(el, stock);
+        if (el) createChart(el, chartStock);
       });
     }
   }
@@ -1437,19 +1779,47 @@ async function submitAdd() {
   }
 
   const btn = document.getElementById('m-submit');
-  btn.textContent = '添加中...';
+  btn.textContent = '正在验证...';
   btn.disabled = true;
+  msg.className = 'msg';
+  msg.textContent = '';
 
   try {
     const resp = await fetch('/api/add-stock', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const json = await resp.json();
-    if (json.error) {
+    if (!resp.ok || json.error) {
       msg.className = 'msg err';
-      msg.textContent = json.error;
+      msg.textContent = json.error || '添加失败，请重试';
+      btn.textContent = '添加';
+      btn.disabled = false;
+      return;
+    }
+
+    btn.textContent = '获取数据中...';
+    msg.className = 'msg ok';
+    msg.textContent = '添加成功！';
+
+    if (json.stock && !json.stock.error && json.tab && json.group) {
+      const tabName = json.tab;
+      const grpName = json.group;
+      if (!TABS_DATA[tabName]) {
+        TABS_DATA[tabName] = { currency: '', groups: {} };
+        tabNames = ['资讯', ...Object.keys(TABS_DATA)];
+        initTabs();
+      }
+      const grps = TABS_DATA[tabName].groups;
+      if (!grps[grpName]) grps[grpName] = [];
+      grps[grpName].push(json.stock);
+
+      setTimeout(() => {
+        closeModal();
+        switchTab(tabName);
+      }, 600);
     } else {
-      msg.className = 'msg ok';
-      msg.textContent = `已添加 ${json.symbol} 到 ${json.tab} / ${json.group}，数据刷新中...`;
-      setTimeout(() => { closeModal(); loadData(); }, 1500);
+      setTimeout(() => {
+        closeModal();
+        loadData();
+      }, 800);
     }
   } catch(e) {
     msg.className = 'msg err';
