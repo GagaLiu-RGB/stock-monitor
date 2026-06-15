@@ -33,10 +33,10 @@ def load_config():
         tabs[tab_name] = {}
         for grp_name, stocks in groups.items():
             tabs[tab_name][grp_name] = [tuple(s) for s in stocks]
-    return tabs, cfg.get("portfolio", {}), cfg.get("tab_currency", {})
+    return tabs, cfg.get("portfolio", {}), cfg.get("tab_currency", {}), cfg.get("descriptions", {})
 
-def save_config(tabs, portfolio, tab_currency):
-    cfg = {"tabs": {}, "portfolio": portfolio, "tab_currency": tab_currency}
+def save_config(tabs, portfolio, tab_currency, descriptions):
+    cfg = {"tabs": {}, "portfolio": portfolio, "tab_currency": tab_currency, "descriptions": descriptions}
     for tab_name, groups in tabs.items():
         cfg["tabs"][tab_name] = {}
         for grp_name, stocks in groups.items():
@@ -44,7 +44,7 @@ def save_config(tabs, portfolio, tab_currency):
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-TABS, PORTFOLIO, TAB_CURRENCY = load_config()
+TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS = load_config()
 
 LOOKBACK_DAYS = 90
 CACHE_TTL = 300
@@ -124,6 +124,7 @@ def build_json():
 
                 entry = {
                     "symbol": sym, "label": label,
+                    "desc": DESCRIPTIONS.get(sym, ""),
                     "price": safe_float(last),
                     "change": safe_float(change),
                     "changePct": safe_float(change_pct),
@@ -502,6 +503,7 @@ def build_single_stock(sym, label):
 
     entry = {
         "symbol": sym, "label": label,
+        "desc": DESCRIPTIONS.get(sym, ""),
         "price": safe_float(last),
         "change": safe_float(change),
         "changePct": safe_float(change_pct),
@@ -530,10 +532,11 @@ def build_single_stock(sym, label):
 
 @app.route('/api/add-stock', methods=['POST'])
 def api_add_stock():
-    global TABS, PORTFOLIO, TAB_CURRENCY
+    global TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS
     d = request.get_json(force=True)
     symbol = (d.get('symbol') or '').strip().upper()
     label = (d.get('label') or '').strip()
+    desc = (d.get('desc') or '').strip()
     market = d.get('market', '美股')
     group = d.get('group', '关注')
     shares = d.get('shares')
@@ -578,13 +581,16 @@ def api_add_stock():
 
     TABS[tab_name][grp_name].append((symbol, label))
 
+    if desc:
+        DESCRIPTIONS[symbol] = desc
+
     if shares is not None and cost is not None:
         try:
             PORTFOLIO[symbol] = {"shares": float(shares), "cost": float(cost)}
         except:
             pass
 
-    save_config(TABS, PORTFOLIO, TAB_CURRENCY)
+    save_config(TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS)
 
     stock_entry = build_single_stock(symbol, label)
 
@@ -595,7 +601,7 @@ def api_add_stock():
 
 @app.route('/api/remove-stock', methods=['POST'])
 def api_remove_stock():
-    global TABS, PORTFOLIO, TAB_CURRENCY
+    global TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS
     d = request.get_json(force=True)
     symbol = (d.get('symbol') or '').strip()
     if not symbol:
@@ -607,14 +613,15 @@ def api_remove_stock():
             if len(TABS[tab_name][grp_name]) < len(stocks):
                 removed = True
     PORTFOLIO.pop(symbol, None)
+    DESCRIPTIONS.pop(symbol, None)
     if removed:
-        save_config(TABS, PORTFOLIO, TAB_CURRENCY)
+        save_config(TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS)
         cache["updated_ts"] = 0
     return jsonify({"ok": removed})
 
 @app.route('/api/update-portfolio', methods=['POST'])
 def api_update_portfolio():
-    global PORTFOLIO, TAB_CURRENCY
+    global PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS
     d = request.get_json(force=True)
     symbol = (d.get('symbol') or '').strip()
     action = d.get('action', 'set')
@@ -643,7 +650,7 @@ def api_update_portfolio():
     else:
         return jsonify({"error": "参数不完整"}), 400
 
-    save_config(TABS, PORTFOLIO, TAB_CURRENCY)
+    save_config(TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS)
     cache["updated_ts"] = 0
     return jsonify({"ok": True, "portfolio": PORTFOLIO.get(symbol)})
 
@@ -732,6 +739,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
   .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
   .card-head .name { font-size: 14px; font-weight: 600; color: #e0e4f0; }
   .card-head .symbol { font-size: 11px; color: var(--text-dim); margin-left: 6px; font-weight: 400; }
+  .card-head .desc { font-size: 11px; color: #666; font-weight: 400; margin-top: 2px; }
   .card-head .price-block { text-align: right; }
   .card-head .price { font-size: 20px; font-weight: 700; font-feature-settings: 'tnum'; letter-spacing: -0.02em; }
   .card-head .change { font-size: 11px; font-weight: 500; font-feature-settings: 'tnum'; }
@@ -1107,6 +1115,9 @@ HTML_PAGE = r'''<!DOCTYPE html>
 
     <label>中文名称</label>
     <input type="text" id="m-label" placeholder="例：苹果、腾讯">
+
+    <label>一句话描述 <span style="opacity:0.5;font-size:10px">（可选）</span></label>
+    <input type="text" id="m-desc" placeholder="例：CPU/GPU 芯片设计">
 
     <label>市场</label>
     <div class="radio-group" id="m-market">
@@ -1617,10 +1628,11 @@ function renderTab() {
 
       const srcTag = stock.isRealtime ? '' : `<span class="data-src">截至 ${stock.dataDate||''} 收盘</span>`;
 
+      const descHtml = stock.desc ? `<div class="desc">${stock.desc}</div>` : '';
       card.innerHTML = `
         <button class="card-del" onclick="event.stopPropagation();deleteStock('${stock.symbol}','${stock.label}')" title="删除">✕</button>
         <div class="card-head">
-          <div><span class="name">${stock.label}<span class="symbol">${stock.symbol}</span></span></div>
+          <div><span class="name">${stock.label}<span class="symbol">${stock.symbol}</span></span>${descHtml}</div>
           <div class="price-block">
             <div class="price ${cls}">${stock.price.toFixed(2)} <span style="font-size:11px;font-weight:400;opacity:0.5">${currency}</span>${srcTag}</div>
             <div class="change ${cls}">${sign}${Math.abs(stock.change).toFixed(2)} (${sign}${Math.abs(stock.changePct).toFixed(2)}%)</div>
@@ -1744,6 +1756,7 @@ function openModal() {
   document.getElementById('modalOverlay').classList.add('show');
   document.getElementById('m-symbol').value = '';
   document.getElementById('m-label').value = '';
+  document.getElementById('m-desc').value = '';
   document.getElementById('m-shares').value = '';
   document.getElementById('m-cost').value = '';
   document.getElementById('m-msg').className = 'msg';
@@ -1759,6 +1772,7 @@ function closeModal() {
 async function submitAdd() {
   const symbol = document.getElementById('m-symbol').value.trim();
   const label = document.getElementById('m-label').value.trim();
+  const desc = document.getElementById('m-desc').value.trim();
   const market = getRadioVal('m-market');
   const group = getRadioVal('m-group');
   const msg = document.getElementById('m-msg');
@@ -1770,6 +1784,7 @@ async function submitAdd() {
   }
 
   const body = { symbol, label, market, group };
+  if (desc) body.desc = desc;
 
   if (group.includes('持仓')) {
     const shares = document.getElementById('m-shares').value;
@@ -1838,7 +1853,8 @@ loadData();
 # ── ENTRY POINT ─────────────────────────────────────────
 
 if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8888))
     print("\n📊 Stock Monitor — Dashboard")
-    print("   http://localhost:8888")
+    print(f"   http://localhost:{port}")
     print(f"   数据缓存 {CACHE_TTL}s，刷新页面时按需更新\n")
-    app.run(host='0.0.0.0', port=8888, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)
