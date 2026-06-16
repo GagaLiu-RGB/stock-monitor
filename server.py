@@ -148,6 +148,7 @@ def build_json():
                             "mktVal": safe_float(mkt_val),
                             "pnl": safe_float(pnl),
                             "pnlPct": safe_float(pnl_pct),
+                            "purchases": pf.get("purchases", []),
                         }
 
                 items.append(entry)
@@ -526,6 +527,7 @@ def build_single_stock(sym, label):
             "mktVal": safe_float(mkt_val),
             "pnl": safe_float(pnl),
             "pnlPct": safe_float(pnl_pct),
+            "purchases": pf.get("purchases", []),
         }
 
     return entry
@@ -635,18 +637,23 @@ def api_update_portfolio():
     if action == 'buy' and shares and cost:
         new_shares = old["shares"] + float(shares)
         new_cost = (old["shares"] * old["cost"] + float(shares) * float(cost)) / new_shares if new_shares else 0
-        PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": round(new_cost, 4)}
+        purchases = list(old.get("purchases", []))
+        purchase_date = d.get('purchase_date', datetime.now().strftime('%Y-%m-%d'))
+        purchases.append({"date": purchase_date, "shares": float(shares), "cost": float(cost)})
+        PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": round(new_cost, 4), "purchases": purchases}
     elif action == 'sell' and shares:
         new_shares = old["shares"] - float(shares)
         if new_shares <= 0:
             PORTFOLIO.pop(symbol, None)
         else:
-            PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": old["cost"]}
+            PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": old["cost"], "purchases": list(old.get("purchases", []))}
     elif action == 'set':
         if shares is not None and cost is not None:
-            PORTFOLIO[symbol] = {"shares": float(shares), "cost": float(cost)}
+            purchase_date = d.get('purchase_date', datetime.now().strftime('%Y-%m-%d'))
+            purchases = [{"date": purchase_date, "shares": float(shares), "cost": float(cost)}]
+            PORTFOLIO[symbol] = {"shares": float(shares), "cost": float(cost), "purchases": purchases}
         elif shares is not None:
-            PORTFOLIO[symbol] = {"shares": float(shares), "cost": old.get("cost", 0)}
+            PORTFOLIO[symbol] = {"shares": float(shares), "cost": old.get("cost", 0), "purchases": list(old.get("purchases", []))}
     else:
         return jsonify({"error": "参数不完整"}), 400
 
@@ -916,13 +923,29 @@ HTML_PAGE = r'''<!DOCTYPE html>
   }
   .modal h2 { font-size: 18px; font-weight: 600; color: #e0e4f0; margin-bottom: 20px; }
   .modal label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 6px; margin-top: 14px; }
-  .modal input[type="text"], .modal input[type="number"] {
+  .modal input[type="text"], .modal input[type="number"], .modal input[type="date"] {
     width: 100%; padding: 9px 12px; border-radius: 8px;
     border: 1px solid var(--border); background: var(--bg);
     color: var(--text); font-size: 13px; outline: none;
     transition: border-color 0.15s;
   }
   .modal input:focus { border-color: var(--accent); }
+  .modal input[type="date"] { color-scheme: dark; }
+  .pos-purchases { margin-bottom: 16px; }
+  .pos-purchases-title { font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
+  .pos-purchases-list {
+    background: var(--bg); border-radius: 8px; padding: 10px 12px;
+    font-size: 11px; color: var(--text);
+  }
+  .pos-purchase-row {
+    display: flex; justify-content: space-between; padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .pos-purchase-row:last-child { border-bottom: none; }
+  .pos-total {
+    margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);
+    font-weight: 600; display: flex; justify-content: space-between;
+  }
   .modal .radio-group { display: flex; gap: 8px; flex-wrap: wrap; }
   .modal .radio-btn {
     padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border);
@@ -1102,6 +1125,24 @@ HTML_PAGE = r'''<!DOCTYPE html>
     <div class="actions">
       <button class="btn btn-cancel" onclick="closeEdit()">取消</button>
       <button class="btn btn-primary" id="edit-submit" onclick="submitEdit()">确认</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="positionOverlay" onclick="if(event.target===this)closePositionModal()">
+  <div class="modal" style="width:480px">
+    <h2 id="pos-title">录入持仓</h2>
+    <div id="pos-existing"></div>
+    <label>购买时间</label>
+    <input type="date" id="pos-date">
+    <label>数量（股）</label>
+    <input type="number" id="pos-shares" placeholder="买入股数">
+    <label>成本价（每股）</label>
+    <input type="number" id="pos-cost" step="0.01" placeholder="每股买入价">
+    <div class="msg" id="pos-msg"></div>
+    <div class="actions">
+      <button class="btn btn-cancel" onclick="closePositionModal()">取消</button>
+      <button class="btn btn-primary" onclick="submitPosition()">确认</button>
     </div>
   </div>
 </div>
@@ -1644,6 +1685,7 @@ function renderTab() {
           <div class="stat">${pdLabel}高 <span class="val">${pd.high.toFixed(2)}</span></div>
           <div class="stat">${pdLabel}低 <span class="val">${pd.low.toFixed(2)}</span></div>
           <div class="spacer"></div>
+          <button class="reset-btn" onclick="openPositionModal('${stock.symbol}','${stock.label}')" title="录入持仓">+</button>
           <button class="reset-btn" onclick="resetChart('${safeSym}')" title="重置缩放">⟲</button>
         </div>
         ${recHtml}
@@ -1842,6 +1884,96 @@ async function submitAdd() {
   }
   btn.textContent = '添加';
   btn.disabled = false;
+}
+
+// ── Position Modal ──
+let positionSymbol = '', positionLabel = '';
+
+function findStockData(symbol) {
+  for (const tabData of Object.values(TABS_DATA)) {
+    for (const stocks of Object.values(tabData.groups || {})) {
+      for (const s of stocks) {
+        if (s.symbol === symbol) return s;
+      }
+    }
+  }
+  return null;
+}
+
+function openPositionModal(symbol, label) {
+  positionSymbol = symbol;
+  positionLabel = label;
+  document.getElementById('positionOverlay').classList.add('show');
+  document.getElementById('pos-title').textContent = '录入持仓 · ' + label;
+  document.getElementById('pos-msg').className = 'msg';
+  document.getElementById('pos-msg').textContent = '';
+  document.getElementById('pos-date').value = new Date().toISOString().slice(0, 10);
+  document.getElementById('pos-shares').value = '';
+  document.getElementById('pos-cost').value = '';
+
+  const stock = findStockData(symbol);
+  const existing = document.getElementById('pos-existing');
+  const pf = stock && stock.portfolio;
+  if (pf && pf.purchases && pf.purchases.length > 0) {
+    const rows = pf.purchases.map(p =>
+      '<div class="pos-purchase-row"><span>' + p.date + '</span><span>' + p.shares + '股 × ' + p.cost.toFixed(2) + '</span></div>'
+    ).join('');
+    existing.innerHTML =
+      '<div class="pos-purchases">' +
+        '<div class="pos-purchases-title">已有买入记录</div>' +
+        '<div class="pos-purchases-list">' + rows +
+          '<div class="pos-total"><span>合计</span><span>' + pf.shares + '股, 均价 ' + pf.cost.toFixed(2) + '</span></div>' +
+        '</div>' +
+      '</div>';
+  } else if (pf && pf.shares) {
+    existing.innerHTML =
+      '<div class="pos-purchases">' +
+        '<div class="pos-purchases-title">当前持仓</div>' +
+        '<div class="pos-purchases-list">' +
+          '<div class="pos-total"><span>合计</span><span>' + pf.shares + '股, 均价 ' + pf.cost.toFixed(2) + '</span></div>' +
+        '</div>' +
+      '</div>';
+  } else {
+    existing.innerHTML = '';
+  }
+}
+
+function closePositionModal() {
+  document.getElementById('positionOverlay').classList.remove('show');
+}
+
+async function submitPosition() {
+  const msg = document.getElementById('pos-msg');
+  const date = document.getElementById('pos-date').value;
+  const shares = parseFloat(document.getElementById('pos-shares').value);
+  const cost = parseFloat(document.getElementById('pos-cost').value);
+
+  if (!shares || shares <= 0) { msg.className = 'msg err'; msg.textContent = '请填写有效的数量'; return; }
+  if (!cost || cost <= 0) { msg.className = 'msg err'; msg.textContent = '请填写有效的成本价'; return; }
+  if (!date) { msg.className = 'msg err'; msg.textContent = '请选择购买时间'; return; }
+
+  try {
+    const resp = await fetch('/api/update-portfolio', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        symbol: positionSymbol,
+        action: 'buy',
+        shares: shares,
+        cost: cost,
+        purchase_date: date
+      })
+    });
+    const json = await resp.json();
+    if (json.error) {
+      msg.className = 'msg err'; msg.textContent = json.error;
+    } else {
+      msg.className = 'msg ok'; msg.textContent = '持仓已更新';
+      setTimeout(function() { closePositionModal(); loadData(); }, 800);
+    }
+  } catch(e) {
+    msg.className = 'msg err'; msg.textContent = '请求失败: ' + e.message;
+  }
 }
 
 loadData();
