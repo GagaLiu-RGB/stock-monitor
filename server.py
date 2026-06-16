@@ -149,6 +149,7 @@ def build_json():
                             "pnl": safe_float(pnl),
                             "pnlPct": safe_float(pnl_pct),
                             "purchases": pf.get("purchases", []),
+                            "sales": pf.get("sales", []),
                         }
 
                 items.append(entry)
@@ -528,6 +529,7 @@ def build_single_stock(sym, label):
             "pnl": safe_float(pnl),
             "pnlPct": safe_float(pnl_pct),
             "purchases": pf.get("purchases", []),
+            "sales": pf.get("sales", []),
         }
 
     return entry
@@ -588,7 +590,11 @@ def api_add_stock():
 
     if shares is not None and cost is not None:
         try:
-            PORTFOLIO[symbol] = {"shares": float(shares), "cost": float(cost)}
+            PORTFOLIO[symbol] = {
+                "shares": float(shares), "cost": float(cost),
+                "purchases": [{"date": datetime.now().strftime('%Y-%m-%d'), "shares": float(shares), "cost": float(cost)}],
+                "sales": [],
+            }
         except:
             pass
 
@@ -623,7 +629,7 @@ def api_remove_stock():
 
 @app.route('/api/update-portfolio', methods=['POST'])
 def api_update_portfolio():
-    global PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS
+    global TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS
     d = request.get_json(force=True)
     symbol = (d.get('symbol') or '').strip()
     action = d.get('action', 'set')
@@ -633,6 +639,7 @@ def api_update_portfolio():
         return jsonify({"error": "缺少代码"}), 400
 
     old = PORTFOLIO.get(symbol, {"shares": 0, "cost": 0})
+    old_sales = list(old.get("sales", []))
 
     if action == 'buy' and shares and cost:
         new_shares = old["shares"] + float(shares)
@@ -640,26 +647,55 @@ def api_update_portfolio():
         purchases = list(old.get("purchases", []))
         purchase_date = d.get('purchase_date', datetime.now().strftime('%Y-%m-%d'))
         purchases.append({"date": purchase_date, "shares": float(shares), "cost": float(cost)})
-        PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": round(new_cost, 4), "purchases": purchases}
+        PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": round(new_cost, 4), "purchases": purchases, "sales": old_sales}
     elif action == 'sell' and shares:
+        sell_cost = float(cost) if cost else 0
+        sell_date = d.get('purchase_date', datetime.now().strftime('%Y-%m-%d'))
+        sales = list(old.get("sales", []))
+        sales.append({"date": sell_date, "shares": float(shares), "cost": sell_cost})
         new_shares = old["shares"] - float(shares)
         if new_shares <= 0:
             PORTFOLIO.pop(symbol, None)
         else:
-            PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": old["cost"], "purchases": list(old.get("purchases", []))}
+            PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": old["cost"], "purchases": list(old.get("purchases", [])), "sales": sales}
     elif action == 'set':
         if shares is not None and cost is not None:
             purchase_date = d.get('purchase_date', datetime.now().strftime('%Y-%m-%d'))
             purchases = [{"date": purchase_date, "shares": float(shares), "cost": float(cost)}]
-            PORTFOLIO[symbol] = {"shares": float(shares), "cost": float(cost), "purchases": purchases}
+            PORTFOLIO[symbol] = {"shares": float(shares), "cost": float(cost), "purchases": purchases, "sales": old_sales}
         elif shares is not None:
-            PORTFOLIO[symbol] = {"shares": float(shares), "cost": old.get("cost", 0), "purchases": list(old.get("purchases", []))}
+            PORTFOLIO[symbol] = {"shares": float(shares), "cost": old.get("cost", 0), "purchases": list(old.get("purchases", [])), "sales": old_sales}
     else:
         return jsonify({"error": "参数不完整"}), 400
 
+    # Auto-move stock to "我的持仓" group
+    moved_to = None
+    if PORTFOLIO.get(symbol):
+        for tab_name, groups in TABS.items():
+            for grp_name, stocks in groups.items():
+                if any(s[0] == symbol for s in stocks):
+                    if '持仓' not in grp_name:
+                        pf_grp = None
+                        for g in groups:
+                            if '持仓' in g:
+                                pf_grp = g
+                                break
+                        if not pf_grp:
+                            pf_grp = '我的持仓'
+                            new_groups = {pf_grp: []}
+                            new_groups.update(TABS[tab_name])
+                            TABS[tab_name] = new_groups
+                        stock_entry = next(s for s in stocks if s[0] == symbol)
+                        TABS[tab_name][grp_name] = [s for s in stocks if s[0] != symbol]
+                        TABS[tab_name][pf_grp].append(stock_entry)
+                        moved_to = pf_grp
+                    break
+            if moved_to is not None:
+                break
+
     save_config(TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS)
     cache["updated_ts"] = 0
-    return jsonify({"ok": True, "portfolio": PORTFOLIO.get(symbol)})
+    return jsonify({"ok": True, "portfolio": PORTFOLIO.get(symbol), "moved_to": moved_to})
 
 # ── HTML (self-contained) ──────────────────────────────
 
@@ -937,6 +973,16 @@ HTML_PAGE = r'''<!DOCTYPE html>
     background: var(--bg); border-radius: 8px; padding: 10px 12px;
     font-size: 11px; color: var(--text);
   }
+  .pos-action-tabs { display: flex; gap: 4px; margin-bottom: 14px; }
+  .pos-action-tab {
+    flex: 1; padding: 8px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text-dim); font-size: 13px; font-weight: 500;
+    cursor: pointer; text-align: center; transition: all 0.15s;
+  }
+  .pos-action-tab.active { border-color: var(--accent); color: var(--accent); background: rgba(91,141,239,0.08); }
+  .pos-action-tab.sell-tab.active { border-color: var(--down); color: var(--down); background: rgba(34,197,94,0.08); }
+  .pos-sell-row { color: var(--down); }
+  .pos-buy-row { color: var(--text); }
   .pos-purchase-row {
     display: flex; justify-content: space-between; padding: 4px 0;
     border-bottom: 1px solid rgba(255,255,255,0.04);
@@ -1132,12 +1178,16 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <div class="modal-overlay" id="positionOverlay" onclick="if(event.target===this)closePositionModal()">
   <div class="modal" style="width:480px">
     <h2 id="pos-title">录入持仓</h2>
+    <div class="pos-action-tabs">
+      <div class="pos-action-tab active" onclick="setPosAction('buy')">买入</div>
+      <div class="pos-action-tab sell-tab" onclick="setPosAction('sell')">卖出</div>
+    </div>
     <div id="pos-existing"></div>
-    <label>购买时间</label>
+    <label id="pos-date-label">购买时间</label>
     <input type="date" id="pos-date">
-    <label>数量（股）</label>
+    <label id="pos-shares-label">数量（股）</label>
     <input type="number" id="pos-shares" placeholder="买入股数">
-    <label>成本价（每股）</label>
+    <label id="pos-cost-label">成本价（每股）</label>
     <input type="number" id="pos-cost" step="0.01" placeholder="每股买入价">
     <div class="msg" id="pos-msg"></div>
     <div class="actions">
@@ -1451,20 +1501,61 @@ function createChart(container, stock) {
   });
 
   const ohlc = stock.ohlc.map(d => ({ time: d.date, open: d.open, high: d.high, low: d.low, close: d.close }));
+  const dateSet = new Set(ohlc.map(d => d.time));
 
+  let mainSeries;
   if (currentMode === 'candle') {
-    const s = chart.addCandlestickSeries({
+    mainSeries = chart.addCandlestickSeries({
       upColor: '#ef4444', downColor: '#22c55e',
       borderUpColor: '#ef4444', borderDownColor: '#22c55e',
       wickUpColor: '#ef4444', wickDownColor: '#22c55e',
     });
-    s.setData(ohlc);
+    mainSeries.setData(ohlc);
   } else {
-    const s = chart.addAreaSeries({
+    mainSeries = chart.addAreaSeries({
       lineColor: '#5b8def', topColor: 'rgba(91,141,239,0.15)',
       bottomColor: 'rgba(91,141,239,0.01)', lineWidth: 2,
     });
-    s.setData(ohlc.map(d => ({ time: d.time, value: d.close })));
+    mainSeries.setData(ohlc.map(d => ({ time: d.time, value: d.close })));
+  }
+
+  // Buy/Sell markers
+  const pf = stock.portfolio;
+  if (pf) {
+    const markers = [];
+    const closePriceMap = {};
+    ohlc.forEach(d => { closePriceMap[d.time] = d.close; });
+
+    if (pf.purchases) {
+      pf.purchases.forEach(p => {
+        if (dateSet.has(p.date)) {
+          markers.push({
+            time: p.date,
+            position: 'belowBar',
+            color: '#ef4444',
+            shape: 'arrowUp',
+            text: '买 ' + p.shares + '股@' + p.cost.toFixed(2),
+          });
+        }
+      });
+    }
+    if (pf.sales) {
+      pf.sales.forEach(p => {
+        if (dateSet.has(p.date)) {
+          markers.push({
+            time: p.date,
+            position: 'aboveBar',
+            color: '#22c55e',
+            shape: 'arrowDown',
+            text: '卖 ' + p.shares + '股@' + p.cost.toFixed(2),
+          });
+        }
+      });
+    }
+    if (markers.length > 0) {
+      markers.sort((a, b) => a.time < b.time ? -1 : a.time > b.time ? 1 : 0);
+      mainSeries.setMarkers(markers);
+    }
   }
 
   chart.addLineSeries({ color: '#ffb040', lineWidth: 1, lineStyle: 2 }).setData(calcMA(stock.ohlc, 5));
@@ -1747,6 +1838,7 @@ function renderEditFields(shares, cost) {
       <div class="hint">自动计算新的均价</div>`;
   } else if (editAction === 'sell') {
     f.innerHTML = `<label>卖出数量（股）</label><input type="number" id="e-shares" placeholder="卖出股数">
+      <label>卖出价格</label><input type="number" id="e-cost" step="0.01" placeholder="每股卖出价">
       <div class="hint">卖出后成本价不变，全部卖出则移除持仓</div>`;
   } else {
     f.innerHTML = `<label>总股数</label><input type="number" id="e-shares" placeholder="当前持仓总数" value="${shares||''}">
@@ -1764,6 +1856,7 @@ async function submitEdit() {
 
   if (!body.shares && editAction !== 'set') { msg.className='msg err'; msg.textContent='请填写数量'; return; }
   if (editAction === 'buy' && !body.cost) { msg.className='msg err'; msg.textContent='请填写买入价'; return; }
+  if (editAction === 'sell' && !body.cost) { msg.className='msg err'; msg.textContent='请填写卖出价'; return; }
 
   try {
     const resp = await fetch('/api/update-portfolio', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
@@ -1887,7 +1980,7 @@ async function submitAdd() {
 }
 
 // ── Position Modal ──
-let positionSymbol = '', positionLabel = '';
+let positionSymbol = '', positionLabel = '', posAction = 'buy';
 
 function findStockData(symbol) {
   for (const tabData of Object.values(TABS_DATA)) {
@@ -1900,9 +1993,51 @@ function findStockData(symbol) {
   return null;
 }
 
+function setPosAction(action) {
+  posAction = action;
+  document.querySelectorAll('.pos-action-tab').forEach(t => t.classList.remove('active'));
+  const tabs = document.querySelectorAll('.pos-action-tab');
+  if (action === 'buy') { tabs[0].classList.add('active'); }
+  else { tabs[1].classList.add('active'); }
+  document.getElementById('pos-date-label').textContent = action === 'buy' ? '购买时间' : '卖出时间';
+  document.getElementById('pos-shares').placeholder = action === 'buy' ? '买入股数' : '卖出股数';
+  document.getElementById('pos-shares-label').textContent = action === 'buy' ? '数量（股）' : '卖出数量（股）';
+  document.getElementById('pos-cost-label').textContent = action === 'buy' ? '成本价（每股）' : '卖出价（每股）';
+  document.getElementById('pos-cost').placeholder = action === 'buy' ? '每股买入价' : '每股卖出价';
+  renderPosExisting();
+}
+
+function renderPosExisting() {
+  const stock = findStockData(positionSymbol);
+  const existing = document.getElementById('pos-existing');
+  const pf = stock && stock.portfolio;
+  let html = '';
+
+  if (pf && pf.purchases && pf.purchases.length > 0) {
+    const buyRows = pf.purchases.map(p =>
+      '<div class="pos-purchase-row pos-buy-row"><span>' + p.date + '</span><span>买入 ' + p.shares + '股 × ' + p.cost.toFixed(2) + '</span></div>'
+    ).join('');
+    html += '<div class="pos-purchases"><div class="pos-purchases-title">买入记录</div><div class="pos-purchases-list">' + buyRows + '</div></div>';
+  }
+
+  if (pf && pf.sales && pf.sales.length > 0) {
+    const sellRows = pf.sales.map(p =>
+      '<div class="pos-purchase-row pos-sell-row"><span>' + p.date + '</span><span>卖出 ' + p.shares + '股 × ' + p.cost.toFixed(2) + '</span></div>'
+    ).join('');
+    html += '<div class="pos-purchases"><div class="pos-purchases-title">卖出记录</div><div class="pos-purchases-list">' + sellRows + '</div></div>';
+  }
+
+  if (pf && pf.shares) {
+    html += '<div class="pos-purchases"><div class="pos-purchases-list"><div class="pos-total"><span>当前持仓</span><span>' + pf.shares + '股, 均价 ' + pf.cost.toFixed(2) + '</span></div></div></div>';
+  }
+
+  existing.innerHTML = html;
+}
+
 function openPositionModal(symbol, label) {
   positionSymbol = symbol;
   positionLabel = label;
+  posAction = 'buy';
   document.getElementById('positionOverlay').classList.add('show');
   document.getElementById('pos-title').textContent = '录入持仓 · ' + label;
   document.getElementById('pos-msg').className = 'msg';
@@ -1910,32 +2045,9 @@ function openPositionModal(symbol, label) {
   document.getElementById('pos-date').value = new Date().toISOString().slice(0, 10);
   document.getElementById('pos-shares').value = '';
   document.getElementById('pos-cost').value = '';
-
-  const stock = findStockData(symbol);
-  const existing = document.getElementById('pos-existing');
-  const pf = stock && stock.portfolio;
-  if (pf && pf.purchases && pf.purchases.length > 0) {
-    const rows = pf.purchases.map(p =>
-      '<div class="pos-purchase-row"><span>' + p.date + '</span><span>' + p.shares + '股 × ' + p.cost.toFixed(2) + '</span></div>'
-    ).join('');
-    existing.innerHTML =
-      '<div class="pos-purchases">' +
-        '<div class="pos-purchases-title">已有买入记录</div>' +
-        '<div class="pos-purchases-list">' + rows +
-          '<div class="pos-total"><span>合计</span><span>' + pf.shares + '股, 均价 ' + pf.cost.toFixed(2) + '</span></div>' +
-        '</div>' +
-      '</div>';
-  } else if (pf && pf.shares) {
-    existing.innerHTML =
-      '<div class="pos-purchases">' +
-        '<div class="pos-purchases-title">当前持仓</div>' +
-        '<div class="pos-purchases-list">' +
-          '<div class="pos-total"><span>合计</span><span>' + pf.shares + '股, 均价 ' + pf.cost.toFixed(2) + '</span></div>' +
-        '</div>' +
-      '</div>';
-  } else {
-    existing.innerHTML = '';
-  }
+  document.querySelectorAll('.pos-action-tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('.pos-action-tab').classList.add('active');
+  setPosAction('buy');
 }
 
 function closePositionModal() {
@@ -1949,8 +2061,14 @@ async function submitPosition() {
   const cost = parseFloat(document.getElementById('pos-cost').value);
 
   if (!shares || shares <= 0) { msg.className = 'msg err'; msg.textContent = '请填写有效的数量'; return; }
-  if (!cost || cost <= 0) { msg.className = 'msg err'; msg.textContent = '请填写有效的成本价'; return; }
-  if (!date) { msg.className = 'msg err'; msg.textContent = '请选择购买时间'; return; }
+  if (posAction === 'buy' && (!cost || cost <= 0)) { msg.className = 'msg err'; msg.textContent = '请填写有效的买入价'; return; }
+  if (posAction === 'sell' && (!cost || cost <= 0)) { msg.className = 'msg err'; msg.textContent = '请填写有效的卖出价'; return; }
+  if (!date) { msg.className = 'msg err'; msg.textContent = '请选择时间'; return; }
+
+  const stock = findStockData(positionSymbol);
+  const hasPortfolio = stock && stock.portfolio && stock.portfolio.shares > 0;
+  let action = posAction;
+  if (posAction === 'buy' && !hasPortfolio) action = 'set';
 
   try {
     const resp = await fetch('/api/update-portfolio', {
@@ -1958,7 +2076,7 @@ async function submitPosition() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         symbol: positionSymbol,
-        action: 'buy',
+        action: action,
         shares: shares,
         cost: cost,
         purchase_date: date
@@ -1968,7 +2086,8 @@ async function submitPosition() {
     if (json.error) {
       msg.className = 'msg err'; msg.textContent = json.error;
     } else {
-      msg.className = 'msg ok'; msg.textContent = '持仓已更新';
+      const label = posAction === 'buy' ? '买入已记录' : '卖出已记录';
+      msg.className = 'msg ok'; msg.textContent = label + (json.moved_to ? '，已移至「' + json.moved_to + '」' : '');
       setTimeout(function() { closePositionModal(); loadData(); }, 800);
     }
   } catch(e) {
