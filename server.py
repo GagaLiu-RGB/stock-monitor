@@ -602,6 +602,14 @@ def api_add_stock():
 
     stock_entry = build_single_stock(symbol, label)
 
+    # Inject into live cache so the next /api/data call includes the new stock
+    # immediately, without waiting for the full background refresh.
+    if cache["data"] and tab_name in cache["data"]:
+        groups = cache["data"][tab_name].get("groups", {})
+        if grp_name not in groups:
+            groups[grp_name] = []
+        groups[grp_name].append(stock_entry)
+
     cache["updated_ts"] = 0
     t = threading.Thread(target=ensure_data, args=(True,), daemon=True)
     t.start()
