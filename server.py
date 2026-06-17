@@ -1586,11 +1586,21 @@ function createChart(container, stock) {
     const closePriceMap = {};
     ohlc.forEach(d => { closePriceMap[d.time] = d.close; });
 
+    const ohlcDates = ohlc.map(d => d.time).sort();
+    function snapDate(d) {
+      if (dateSet.has(d)) return d;
+      if (!ohlcDates.length) return null;
+      if (d <= ohlcDates[0]) return ohlcDates[0];
+      if (d >= ohlcDates[ohlcDates.length-1]) return ohlcDates[ohlcDates.length-1];
+      for (let i = ohlcDates.length-1; i >= 0; i--) { if (ohlcDates[i] <= d) return ohlcDates[i]; }
+      return ohlcDates[0];
+    }
     if (pf.purchases) {
       pf.purchases.forEach(p => {
-        if (dateSet.has(p.date)) {
+        const t = snapDate(p.date);
+        if (t) {
           markers.push({
-            time: p.date,
+            time: t,
             position: 'belowBar',
             color: '#ef4444',
             shape: 'arrowUp',
@@ -1601,9 +1611,10 @@ function createChart(container, stock) {
     }
     if (pf.sales) {
       pf.sales.forEach(p => {
-        if (dateSet.has(p.date)) {
+        const t = snapDate(p.date);
+        if (t) {
           markers.push({
-            time: p.date,
+            time: t,
             position: 'aboveBar',
             color: '#22c55e',
             shape: 'arrowDown',
@@ -1924,7 +1935,7 @@ async function submitEdit() {
     if (json.error) { msg.className='msg err'; msg.textContent=json.error; }
     else {
       msg.className='msg ok'; msg.textContent='已更新' + (json.moved_to ? '，已移至「' + json.moved_to + '」' : '');
-      setTimeout(()=>{ location.reload(); }, 800);
+      setTimeout(function() { closeEdit(); loadData(); }, 600);
     }
   } catch(e) { msg.className='msg err'; msg.textContent='请求失败'; }
 }
@@ -2151,7 +2162,7 @@ async function submitPosition() {
     } else {
       const label = posAction === 'buy' ? '买入已记录' : '卖出已记录';
       msg.className = 'msg ok'; msg.textContent = label + (json.moved_to ? '，已移至「' + json.moved_to + '」' : '');
-      setTimeout(function() { location.reload(); }, 800);
+      setTimeout(function() { closePositionModal(); loadData(); }, 600);
     }
   } catch(e) {
     msg.className = 'msg err'; msg.textContent = '请求失败: ' + e.message;
