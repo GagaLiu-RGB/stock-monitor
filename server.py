@@ -694,8 +694,60 @@ def api_update_portfolio():
                 break
 
     save_config(TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS)
-    cache["updated_ts"] = 0
-    return jsonify({"ok": True, "portfolio": PORTFOLIO.get(symbol), "moved_to": moved_to})
+
+    # Update cache in-place: move stock between groups and update portfolio info
+    # without triggering a full yfinance refetch
+    pf_data = PORTFOLIO.get(symbol)
+    result = {"ok": True, "portfolio": pf_data, "moved": moved_to is not None, "moved_to": moved_to}
+
+    if cache["data"]:
+        for tab_name_c, tab_info in cache["data"].items():
+            groups = tab_info.get("groups", {})
+            for grp_name_c, stocks_list in groups.items():
+                for idx, s in enumerate(stocks_list):
+                    if s.get("symbol") == symbol:
+                        # Update portfolio display data in cache
+                        if pf_data and "shares" in pf_data and "cost" in pf_data:
+                            price = s.get("price", 0)
+                            shares_c = pf_data["shares"]
+                            cost_c = pf_data["cost"]
+                            mkt_val = price * shares_c
+                            pnl = (price - cost_c) * shares_c
+                            pnl_pct = (price - cost_c) / cost_c * 100 if cost_c else 0
+                            s["portfolio"] = {
+                                "type": "stock", "shares": shares_c,
+                                "cost": round(cost_c, 3),
+                                "mktVal": safe_float(mkt_val),
+                                "pnl": safe_float(pnl),
+                                "pnlPct": safe_float(pnl_pct),
+                                "purchases": pf_data.get("purchases", []),
+                                "sales": pf_data.get("sales", []),
+                            }
+                            result["stock_portfolio"] = s["portfolio"]
+                            result["price"] = price
+                        elif not pf_data:
+                            s.pop("portfolio", None)
+
+                        # Handle group move in cache
+                        if moved_to and grp_name_c != moved_to:
+                            stocks_list.pop(idx)
+                            if moved_to not in groups:
+                                # Insert the new group at the beginning
+                                new_groups = {moved_to: [s]}
+                                new_groups.update(groups)
+                                tab_info["groups"] = new_groups
+                            else:
+                                groups[moved_to].append(s)
+                            result["from_group"] = grp_name_c
+                        break
+                else:
+                    continue
+                break
+            else:
+                continue
+            break
+
+    return jsonify(result)
 
 # ── HTML (self-contained) ──────────────────────────────
 
@@ -1862,7 +1914,10 @@ async function submitEdit() {
     const resp = await fetch('/api/update-portfolio', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const json = await resp.json();
     if (json.error) { msg.className='msg err'; msg.textContent=json.error; }
-    else { msg.className='msg ok'; msg.textContent='已更新'; setTimeout(()=>{ closeEdit(); loadData(); }, 800); }
+    else {
+      msg.className='msg ok'; msg.textContent='已更新' + (json.moved_to ? '，已移至「' + json.moved_to + '」' : '');
+      setTimeout(()=>{ location.reload(); }, 800);
+    }
   } catch(e) { msg.className='msg err'; msg.textContent='请求失败'; }
 }
 
@@ -2088,7 +2143,7 @@ async function submitPosition() {
     } else {
       const label = posAction === 'buy' ? '买入已记录' : '卖出已记录';
       msg.className = 'msg ok'; msg.textContent = label + (json.moved_to ? '，已移至「' + json.moved_to + '」' : '');
-      setTimeout(function() { closePositionModal(); loadData(); }, 800);
+      setTimeout(function() { location.reload(); }, 800);
     }
   } catch(e) {
     msg.className = 'msg err'; msg.textContent = '请求失败: ' + e.message;
