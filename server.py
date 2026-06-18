@@ -102,6 +102,8 @@ def _backfill_realized_pnl():
 
 _backfill_realized_pnl()
 
+THROTTLE_DELAY = 0.3
+
 def fetch_yf(symbol, days=LOOKBACK_DAYS):
     end = datetime.now()
     start = end - timedelta(days=days + 10)
@@ -112,6 +114,40 @@ def fetch_yf(symbol, days=LOOKBACK_DAYS):
         return df.tail(days) if len(df) > days else df
     except:
         return pd.DataFrame()
+
+def batch_fetch_yf(symbols, days=LOOKBACK_DAYS):
+    """Download historical data for all symbols in a single API call."""
+    if not symbols:
+        return {}
+    end = datetime.now()
+    start = end - timedelta(days=days + 10)
+    result = {}
+    try:
+        df = yf.download(symbols, start=start, end=end, progress=False,
+                         auto_adjust=True, group_by='ticker', threads=True)
+        if df.empty:
+            return {s: pd.DataFrame() for s in symbols}
+
+        for sym in symbols:
+            try:
+                if len(symbols) == 1:
+                    sdf = df.copy()
+                else:
+                    sdf = df[sym].copy() if sym in df.columns.get_level_values(0) else pd.DataFrame()
+                if isinstance(sdf.columns, pd.MultiIndex):
+                    sdf.columns = sdf.columns.get_level_values(0)
+                sdf = sdf.dropna(how='all')
+                result[sym] = sdf.tail(days) if len(sdf) > days else sdf
+            except:
+                result[sym] = pd.DataFrame()
+    except Exception as e:
+        print(f"[batch_fetch_yf] 批量下载失败: {e}", flush=True)
+        return {s: pd.DataFrame() for s in symbols}
+
+    for s in symbols:
+        if s not in result:
+            result[s] = pd.DataFrame()
+    return result
 
 def fetch_realtime_price(symbol):
     """Get latest price via fast_info (includes pre/post market when available)."""
@@ -125,15 +161,38 @@ def fetch_realtime_price(symbol):
     except:
         return None, None
 
+def fetch_realtime_price_throttled(symbol):
+    """Throttled version to avoid rate limiting."""
+    time.sleep(THROTTLE_DELAY)
+    return fetch_realtime_price(symbol)
+
 
 def build_json():
+    all_symbols = []
+    sym_label_map = {}
+    for tab_name, groups in TABS.items():
+        for group_name, stocks in groups.items():
+            for sym, label in stocks:
+                if sym not in sym_label_map:
+                    all_symbols.append(sym)
+                    sym_label_map[sym] = label
+
+    batch_data = batch_fetch_yf(all_symbols)
+
+    rt_prices = {}
+    for sym in all_symbols:
+        price, prev = fetch_realtime_price(sym)
+        rt_prices[sym] = (price, prev)
+        if price is not None:
+            time.sleep(THROTTLE_DELAY)
+
     output = {}
     for tab_name, groups in TABS.items():
         tab_groups = {}
         for group_name, stocks in groups.items():
             items = []
             for sym, label in stocks:
-                df = fetch_yf(sym)
+                df = batch_data.get(sym, pd.DataFrame())
                 if df.empty:
                     items.append({"symbol": sym, "label": label, "error": True})
                     continue
@@ -156,7 +215,7 @@ def build_json():
 
                 last_ohlc_date = df_clean.index[-1].strftime('%m/%d')
 
-                rt_price, rt_prev = fetch_realtime_price(sym)
+                rt_price, rt_prev = rt_prices.get(sym, (None, None))
                 if rt_price is not None:
                     last = rt_price
                     prev = rt_prev if rt_prev is not None else (float(close[-2]) if len(close) > 1 else last)
