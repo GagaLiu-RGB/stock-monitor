@@ -661,11 +661,8 @@ def api_update_portfolio():
         sell_date = d.get('purchase_date', datetime.now().strftime('%Y-%m-%d'))
         sales = list(old.get("sales", []))
         sales.append({"date": sell_date, "shares": float(shares), "cost": sell_cost})
-        new_shares = old["shares"] - float(shares)
-        if new_shares <= 0:
-            PORTFOLIO.pop(symbol, None)
-        else:
-            PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": old["cost"], "purchases": list(old.get("purchases", [])), "sales": sales}
+        new_shares = max(old["shares"] - float(shares), 0)
+        PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": old["cost"], "purchases": list(old.get("purchases", [])), "sales": sales}
     elif action == 'set':
         if shares is not None and cost is not None:
             purchase_date = d.get('purchase_date', datetime.now().strftime('%Y-%m-%d'))
@@ -676,86 +673,117 @@ def api_update_portfolio():
     else:
         return jsonify({"error": "参数不完整"}), 400
 
-    # Auto-move stock to "我的持仓" group
-    moved_to = None
-    if PORTFOLIO.get(symbol):
-        for tab_name, groups in TABS.items():
-            for grp_name, stocks in groups.items():
-                if any(s[0] == symbol for s in stocks):
-                    if '持仓' not in grp_name:
-                        pf_grp = None
-                        for g in groups:
-                            if '持仓' in g:
-                                pf_grp = g
-                                break
-                        if not pf_grp:
-                            pf_grp = '我的持仓'
-                            new_groups = {pf_grp: []}
-                            new_groups.update(TABS[tab_name])
-                            TABS[tab_name] = new_groups
-                        stock_entry = next(s for s in stocks if s[0] == symbol)
-                        TABS[tab_name][grp_name] = [s for s in stocks if s[0] != symbol]
-                        TABS[tab_name][pf_grp].append(stock_entry)
-                        moved_to = pf_grp
-                    break
-            if moved_to is not None:
+    # Auto-move: buy → portfolio group; sell all → watch group
+    moved = False
+    from_group = None
+    to_group = None
+    pf_shares = PORTFOLIO.get(symbol, {}).get("shares", 0)
+
+    for tab_name_m, groups_m in TABS.items():
+        found = False
+        for grp_name_m, stocks_m in groups_m.items():
+            if any(s[0] == symbol for s in stocks_m):
+                found = True
+                if pf_shares > 0 and '持仓' not in grp_name_m:
+                    pf_grp = None
+                    for g in groups_m:
+                        if '持仓' in g:
+                            pf_grp = g
+                            break
+                    if not pf_grp:
+                        pf_grp = '我的持仓'
+                        new_groups = {pf_grp: []}
+                        new_groups.update(TABS[tab_name_m])
+                        TABS[tab_name_m] = new_groups
+                    stock_entry = next(s for s in stocks_m if s[0] == symbol)
+                    TABS[tab_name_m][grp_name_m] = [s for s in stocks_m if s[0] != symbol]
+                    TABS[tab_name_m][pf_grp].append(stock_entry)
+                    moved = True
+                    from_group = grp_name_m
+                    to_group = pf_grp
+                elif pf_shares <= 0 and '持仓' in grp_name_m:
+                    watch_grp = None
+                    for g in groups_m:
+                        if '持仓' not in g and '指数' not in g:
+                            watch_grp = g
+                            break
+                    if not watch_grp:
+                        watch_grp = '关注'
+                        TABS[tab_name_m][watch_grp] = []
+                    stock_entry = next(s for s in stocks_m if s[0] == symbol)
+                    TABS[tab_name_m][grp_name_m] = [s for s in stocks_m if s[0] != symbol]
+                    TABS[tab_name_m][watch_grp].append(stock_entry)
+                    moved = True
+                    from_group = grp_name_m
+                    to_group = watch_grp
                 break
+        if found:
+            break
 
     save_config(TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS)
 
-    # Update cache in-place: move stock between groups and update portfolio info
-    # without triggering a full yfinance refetch
-    pf_data = PORTFOLIO.get(symbol)
-    result = {"ok": True, "portfolio": pf_data, "moved": moved_to is not None, "moved_to": moved_to}
+    # Update cache in-place without triggering a full yfinance refetch
+    pf_data = PORTFOLIO.get(symbol, {})
+    current_price = 0
 
     if cache["data"]:
         for tab_name_c, tab_info in cache["data"].items():
-            groups = tab_info.get("groups", {})
-            for grp_name_c, stocks_list in groups.items():
-                for idx, s in enumerate(stocks_list):
+            groups_c = tab_info.get("groups", {})
+            stock_found = False
+            for grp_name_c, stocks_list in groups_c.items():
+                for idx_c, s in enumerate(stocks_list):
                     if s.get("symbol") == symbol:
-                        # Update portfolio display data in cache
-                        if pf_data and "shares" in pf_data and "cost" in pf_data:
-                            price = s.get("price", 0)
-                            shares_c = pf_data["shares"]
-                            cost_c = pf_data["cost"]
-                            mkt_val = price * shares_c
-                            pnl = (price - cost_c) * shares_c
-                            pnl_pct = (price - cost_c) / cost_c * 100 if cost_c else 0
-                            s["portfolio"] = {
-                                "type": "stock", "shares": shares_c,
-                                "cost": round(cost_c, 3),
-                                "mktVal": safe_float(mkt_val),
-                                "pnl": safe_float(pnl),
-                                "pnlPct": safe_float(pnl_pct),
-                                "purchases": pf_data.get("purchases", []),
-                                "sales": pf_data.get("sales", []),
-                            }
-                            result["stock_portfolio"] = s["portfolio"]
-                            result["price"] = price
-                        elif not pf_data:
-                            s.pop("portfolio", None)
-
-                        # Handle group move in cache
-                        if moved_to and grp_name_c != moved_to:
-                            stocks_list.pop(idx)
-                            if moved_to not in groups:
-                                # Insert the new group at the beginning
-                                new_groups = {moved_to: [s]}
-                                new_groups.update(groups)
-                                tab_info["groups"] = new_groups
+                        stock_found = True
+                        current_price = s.get("price", 0)
+                        sh = pf_data.get("shares", 0)
+                        co = pf_data.get("cost", 0)
+                        mv = current_price * sh if sh > 0 else 0
+                        pl = (current_price - co) * sh if sh > 0 else 0
+                        pp = (current_price - co) / co * 100 if sh > 0 and co > 0 else 0
+                        s["portfolio"] = {
+                            "type": "stock", "shares": sh,
+                            "cost": round(co, 3),
+                            "mktVal": safe_float(mv),
+                            "pnl": safe_float(pl),
+                            "pnlPct": safe_float(pp),
+                            "purchases": pf_data.get("purchases", []),
+                            "sales": pf_data.get("sales", []),
+                        }
+                        if moved and grp_name_c != to_group:
+                            stocks_list.pop(idx_c)
+                            if to_group not in groups_c:
+                                new_grps = {to_group: [s]}
+                                new_grps.update(groups_c)
+                                tab_info["groups"] = new_grps
                             else:
-                                groups[moved_to].append(s)
-                            result["from_group"] = grp_name_c
+                                groups_c[to_group].append(s)
                         break
-                else:
-                    continue
+                if stock_found:
+                    break
+            if stock_found:
                 break
-            else:
-                continue
-            break
 
-    return jsonify(result)
+    sh = pf_data.get("shares", 0)
+    co = pf_data.get("cost", 0)
+    mv = current_price * sh if sh > 0 else 0
+    pl = (current_price - co) * sh if sh > 0 else 0
+    pp = (current_price - co) / co * 100 if sh > 0 and co > 0 else 0
+
+    return jsonify({
+        "ok": True,
+        "moved": moved,
+        "from_group": from_group,
+        "to_group": to_group,
+        "portfolio": {
+            "shares": sh, "cost": round(co, 3),
+            "purchases": pf_data.get("purchases", []),
+            "sales": pf_data.get("sales", []),
+            "mktVal": safe_float(mv),
+            "pnl": safe_float(pl),
+            "pnlPct": safe_float(pp),
+        },
+        "current_price": safe_float(current_price),
+    })
 
 # ── HTML (self-contained) ──────────────────────────────
 
@@ -1478,8 +1506,8 @@ async function loadData() {
     const resp = await fetch('/api/data');
     const json = await resp.json();
     if (json.loading && !json.data) {
-      setTimeout(loadData, 2000);
-      return;
+      await new Promise(r => setTimeout(r, 2000));
+      return loadData();
     }
     if (!json.data) return;
     TABS_DATA = json.data;
@@ -1490,8 +1518,6 @@ async function loadData() {
     if (!activeTab || !tabNames.includes(activeTab)) activeTab = tabNames[0];
     document.getElementById('updateTime').textContent = (json.updated || '—') + (json.loading ? ' · 更新中...' : '');
     initTabs();
-    destroyCharts();
-    renderTab();
   } catch (e) {
     document.getElementById('updateTime').textContent = '加载失败';
     console.error(e);
@@ -1814,7 +1840,7 @@ function renderTab() {
 
       let pfHtml = '';
       const pf = stock.portfolio;
-      if (pf) {
+      if (pf && pf.shares > 0) {
         const pCls = pf.pnl >= 0 ? 'up' : 'down';
         const pSign = pf.pnl >= 0 ? '+' : '-';
         if (pf.type === 'stock') {
@@ -1873,7 +1899,7 @@ async function deleteStock(symbol, label) {
   try {
     const resp = await fetch('/api/remove-stock', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({symbol}) });
     const json = await resp.json();
-    if (json.ok) loadData();
+    if (json.ok) { await loadData(); destroyCharts(); renderTab(); }
   } catch(e) { alert('删除失败: ' + e.message); }
 }
 
@@ -1919,6 +1945,7 @@ function renderEditFields(shares, cost) {
 
 async function submitEdit() {
   const msg = document.getElementById('edit-msg');
+  const btn = document.getElementById('edit-submit');
   const body = { symbol: editSymbol, action: editAction };
   const sharesEl = document.getElementById('e-shares');
   const costEl = document.getElementById('e-cost');
@@ -1929,15 +1956,36 @@ async function submitEdit() {
   if (editAction === 'buy' && !body.cost) { msg.className='msg err'; msg.textContent='请填写买入价'; return; }
   if (editAction === 'sell' && !body.cost) { msg.className='msg err'; msg.textContent='请填写卖出价'; return; }
 
+  btn.textContent = '正在更新...';
+  btn.disabled = true;
+  msg.className = 'msg';
+  msg.textContent = '';
+
   try {
-    const resp = await fetch('/api/update-portfolio', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const json = await resp.json();
-    if (json.error) { msg.className='msg err'; msg.textContent=json.error; }
-    else {
-      msg.className='msg ok'; msg.textContent='已更新' + (json.moved_to ? '，已移至「' + json.moved_to + '」' : '');
-      setTimeout(function() { closeEdit(); loadData(); }, 600);
+    const resp = await fetch('/api/update-portfolio', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+
+    if (!resp.ok || data.error) {
+      msg.className = 'msg err';
+      msg.textContent = data.error || '操作失败';
+      btn.textContent = '确认';
+      btn.disabled = false;
+      return;
     }
-  } catch(e) { msg.className='msg err'; msg.textContent='请求失败'; }
+
+    await loadData();
+    destroyCharts();
+    renderTab();
+    closeEdit();
+  } catch(e) {
+    msg.className = 'msg err';
+    msg.textContent = '请求失败';
+    btn.textContent = '确认';
+    btn.disabled = false;
+  }
 }
 
 // ── Add Modal logic ──
@@ -2035,15 +2083,13 @@ async function submitAdd() {
       if (!grps[grpName]) grps[grpName] = [];
       grps[grpName].push(json.stock);
 
-      setTimeout(() => {
-        closeModal();
-        switchTab(tabName);
-      }, 600);
+      closeModal();
+      switchTab(tabName);
     } else {
-      setTimeout(() => {
-        closeModal();
-        loadData();
-      }, 800);
+      await loadData();
+      destroyCharts();
+      renderTab();
+      closeModal();
     }
   } catch(e) {
     msg.className = 'msg err';
@@ -2128,8 +2174,39 @@ function closePositionModal() {
   document.getElementById('positionOverlay').classList.remove('show');
 }
 
+function updateStockPortfolioData(symbol, portfolio) {
+  const stock = findStockData(symbol);
+  if (!stock) return;
+  stock.portfolio = {
+    type: 'stock',
+    shares: portfolio.shares,
+    cost: portfolio.cost,
+    mktVal: portfolio.mktVal,
+    pnl: portfolio.pnl,
+    pnlPct: portfolio.pnlPct,
+    purchases: portfolio.purchases || [],
+    sales: portfolio.sales || [],
+  };
+}
+
+function moveStockInData(symbol, fromGroup, toGroup) {
+  for (const tabData of Object.values(TABS_DATA)) {
+    const groups = tabData.groups || {};
+    if (groups[fromGroup]) {
+      const idx = groups[fromGroup].findIndex(s => s.symbol === symbol);
+      if (idx !== -1) {
+        const stockData = groups[fromGroup].splice(idx, 1)[0];
+        if (!groups[toGroup]) groups[toGroup] = [];
+        groups[toGroup].push(stockData);
+        return;
+      }
+    }
+  }
+}
+
 async function submitPosition() {
   const msg = document.getElementById('pos-msg');
+  const btn = document.querySelector('#positionOverlay .btn-primary');
   const date = document.getElementById('pos-date').value;
   const shares = parseFloat(document.getElementById('pos-shares').value);
   const cost = parseFloat(document.getElementById('pos-cost').value);
@@ -2138,6 +2215,11 @@ async function submitPosition() {
   if (posAction === 'buy' && (!cost || cost <= 0)) { msg.className = 'msg err'; msg.textContent = '请填写有效的买入价'; return; }
   if (posAction === 'sell' && (!cost || cost <= 0)) { msg.className = 'msg err'; msg.textContent = '请填写有效的卖出价'; return; }
   if (!date) { msg.className = 'msg err'; msg.textContent = '请选择时间'; return; }
+
+  btn.textContent = '正在更新...';
+  btn.disabled = true;
+  msg.className = 'msg';
+  msg.textContent = '';
 
   const stock = findStockData(positionSymbol);
   const hasPortfolio = stock && stock.portfolio && stock.portfolio.shares > 0;
@@ -2148,28 +2230,31 @@ async function submitPosition() {
     const resp = await fetch('/api/update-portfolio', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        symbol: positionSymbol,
-        action: action,
-        shares: shares,
-        cost: cost,
-        purchase_date: date
-      })
+      body: JSON.stringify({ symbol: positionSymbol, action, shares, cost, purchase_date: date })
     });
-    const json = await resp.json();
-    if (json.error) {
-      msg.className = 'msg err'; msg.textContent = json.error;
-    } else {
-      const label = posAction === 'buy' ? '买入已记录' : '卖出已记录';
-      msg.className = 'msg ok'; msg.textContent = label + (json.moved_to ? '，已移至「' + json.moved_to + '」' : '');
-      setTimeout(function() { closePositionModal(); loadData(); }, 600);
+    const data = await resp.json();
+
+    if (!resp.ok || data.error) {
+      msg.className = 'msg err';
+      msg.textContent = data.error || '操作失败';
+      btn.textContent = '确认';
+      btn.disabled = false;
+      return;
     }
+
+    await loadData();
+    destroyCharts();
+    renderTab();
+    closePositionModal();
   } catch(e) {
-    msg.className = 'msg err'; msg.textContent = '请求失败: ' + e.message;
+    msg.className = 'msg err';
+    msg.textContent = '请求失败: ' + e.message;
+    btn.textContent = '确认';
+    btn.disabled = false;
   }
 }
 
-loadData();
+loadData().then(() => { destroyCharts(); renderTab(); });
 </script>
 </body>
 </html>
