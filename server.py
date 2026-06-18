@@ -57,6 +57,51 @@ def safe_float(v, default=0.0):
     f = float(v)
     return default if (np.isnan(f) or np.isinf(f)) else round(f, 3)
 
+def compute_realized_pnl(purchases, sales):
+    """Compute realized P&L and cost basis of sold shares using weighted average method."""
+    if not sales:
+        return 0.0, 0.0
+    events = []
+    for p in (purchases or []):
+        events.append(('buy', p.get('date', ''), float(p['shares']), float(p['cost'])))
+    for s in (sales or []):
+        events.append(('sell', s.get('date', ''), float(s['shares']), float(s['cost'])))
+    events.sort(key=lambda x: x[1])
+
+    total_shares = 0.0
+    total_cost = 0.0
+    realized = 0.0
+    sold_cost_basis = 0.0
+
+    for action, _, shares, price in events:
+        if action == 'buy':
+            total_cost += shares * price
+            total_shares += shares
+        else:
+            if total_shares > 0:
+                avg_cost = total_cost / total_shares
+                realized += (price - avg_cost) * shares
+                sold_cost_basis += avg_cost * shares
+                total_cost -= avg_cost * shares
+                total_shares = max(total_shares - shares, 0)
+
+    return round(realized, 2), round(sold_cost_basis, 2)
+
+# Backfill realized_pnl for portfolio entries that have sales but no realized_pnl yet
+def _backfill_realized_pnl():
+    changed = False
+    for sym, pf in PORTFOLIO.items():
+        if pf.get('sales') and 'realized_pnl' not in pf:
+            rpnl, sold_basis = compute_realized_pnl(pf.get('purchases', []), pf['sales'])
+            pf['realized_pnl'] = rpnl
+            pf['sold_cost_basis'] = sold_basis
+            changed = True
+    if changed:
+        save_config(TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS)
+        print(f"[启动] 已补算 realized_pnl", flush=True)
+
+_backfill_realized_pnl()
+
 def fetch_yf(symbol, days=LOOKBACK_DAYS):
     end = datetime.now()
     start = end - timedelta(days=days + 10)
@@ -142,6 +187,9 @@ def build_json():
                         mkt_val = last * shares
                         pnl = (last - cost) * shares
                         pnl_pct = (last - cost) / cost * 100 if cost else 0
+                        rpnl = pf.get("realized_pnl", 0)
+                        sold_basis = pf.get("sold_cost_basis", 0)
+                        rpnl_pct = (rpnl / sold_basis * 100) if sold_basis else 0
                         entry["portfolio"] = {
                             "type": "stock", "shares": shares,
                             "cost": round(cost, 3),
@@ -150,6 +198,8 @@ def build_json():
                             "pnlPct": safe_float(pnl_pct),
                             "purchases": pf.get("purchases", []),
                             "sales": pf.get("sales", []),
+                            "realizedPnl": safe_float(rpnl),
+                            "realizedPnlPct": safe_float(rpnl_pct),
                         }
 
                 items.append(entry)
@@ -522,6 +572,9 @@ def build_single_stock(sym, label):
         mkt_val = last * shares_val
         pnl = (last - cost_val) * shares_val
         pnl_pct = (last - cost_val) / cost_val * 100 if cost_val else 0
+        rpnl = pf.get("realized_pnl", 0)
+        sold_basis = pf.get("sold_cost_basis", 0)
+        rpnl_pct = (rpnl / sold_basis * 100) if sold_basis else 0
         entry["portfolio"] = {
             "type": "stock", "shares": shares_val,
             "cost": round(cost_val, 3),
@@ -530,6 +583,8 @@ def build_single_stock(sym, label):
             "pnlPct": safe_float(pnl_pct),
             "purchases": pf.get("purchases", []),
             "sales": pf.get("sales", []),
+            "realizedPnl": safe_float(rpnl),
+            "realizedPnlPct": safe_float(rpnl_pct),
         }
 
     return entry
@@ -662,7 +717,13 @@ def api_update_portfolio():
         sales = list(old.get("sales", []))
         sales.append({"date": sell_date, "shares": float(shares), "cost": sell_cost})
         new_shares = max(old["shares"] - float(shares), 0)
-        PORTFOLIO[symbol] = {"shares": round(new_shares, 4), "cost": old["cost"], "purchases": list(old.get("purchases", [])), "sales": sales}
+        purchases_list = list(old.get("purchases", []))
+        rpnl, sold_basis = compute_realized_pnl(purchases_list, sales)
+        PORTFOLIO[symbol] = {
+            "shares": round(new_shares, 4), "cost": old["cost"],
+            "purchases": purchases_list, "sales": sales,
+            "realized_pnl": rpnl, "sold_cost_basis": sold_basis,
+        }
     elif action == 'set':
         if shares is not None and cost is not None:
             purchase_date = d.get('purchase_date', datetime.now().strftime('%Y-%m-%d'))
@@ -740,6 +801,9 @@ def api_update_portfolio():
                         mv = current_price * sh if sh > 0 else 0
                         pl = (current_price - co) * sh if sh > 0 else 0
                         pp = (current_price - co) / co * 100 if sh > 0 and co > 0 else 0
+                        rp = pf_data.get("realized_pnl", 0)
+                        sb = pf_data.get("sold_cost_basis", 0)
+                        rpp = (rp / sb * 100) if sb else 0
                         s["portfolio"] = {
                             "type": "stock", "shares": sh,
                             "cost": round(co, 3),
@@ -748,6 +812,8 @@ def api_update_portfolio():
                             "pnlPct": safe_float(pp),
                             "purchases": pf_data.get("purchases", []),
                             "sales": pf_data.get("sales", []),
+                            "realizedPnl": safe_float(rp),
+                            "realizedPnlPct": safe_float(rpp),
                         }
                         if moved and grp_name_c != to_group:
                             stocks_list.pop(idx_c)
@@ -768,6 +834,9 @@ def api_update_portfolio():
     mv = current_price * sh if sh > 0 else 0
     pl = (current_price - co) * sh if sh > 0 else 0
     pp = (current_price - co) / co * 100 if sh > 0 and co > 0 else 0
+    rp = pf_data.get("realized_pnl", 0)
+    sb = pf_data.get("sold_cost_basis", 0)
+    rpp = (rp / sb * 100) if sb else 0
 
     return jsonify({
         "ok": True,
@@ -781,6 +850,8 @@ def api_update_portfolio():
             "mktVal": safe_float(mv),
             "pnl": safe_float(pl),
             "pnlPct": safe_float(pp),
+            "realizedPnl": safe_float(rp),
+            "realizedPnlPct": safe_float(rpp),
         },
         "current_price": safe_float(current_price),
     })
@@ -1778,13 +1849,14 @@ function renderTab() {
     hasContent = true;
 
     const csym = {'美元':'$','港币':'HK$','人民币':'¥'}[currency] || '¥';
-    let totalVal = 0, totalPnl = 0, hasPf = false;
+    let totalVal = 0, totalPnl = 0, totalRealizedPnl = 0, hasPf = false;
     for (const st of stocks) {
       if (st.error || !st.portfolio) continue;
-      hasPf = true;
       const p = st.portfolio;
+      if (p.shares > 0 || p.realizedPnl) hasPf = true;
       totalVal += p.mktVal || 0;
-      totalPnl += p.pnl;
+      totalPnl += p.pnl || 0;
+      totalRealizedPnl += p.realizedPnl || 0;
     }
 
     const header = document.createElement('div');
@@ -1798,10 +1870,17 @@ function renderTab() {
       const firstDate = stocks.find(s => s.dataDate)?.dataDate || '';
       const allRt = stocks.every(s => s.isRealtime);
       const srcLabel = allRt ? '' : `截至 ${firstDate} 收盘`;
+      let realizedHtml = '';
+      if (totalRealizedPnl) {
+        const rCls = totalRealizedPnl >= 0 ? 'up' : 'down';
+        const rSign = totalRealizedPnl >= 0 ? '+' : '-';
+        realizedHtml = `<span class="gs-item">已实现 <span class="gs-pnl ${rCls}">${rSign}${csym}${fmt(totalRealizedPnl)}</span></span>`;
+      }
       sumHtml = `<div class="group-summary">
         <span class="gs-item">总市值 <span class="gs-val">${csym}${fmt(totalVal)}</span></span>
         <span class="gs-item">总盈亏 <span class="gs-pnl ${sCls}">${sSign}${csym}${fmt(totalPnl)} (${sSign}${pct}%)</span>
         <span style="font-size:10px;opacity:0.4">${srcLabel}</span></span>
+        ${realizedHtml}
       </div>`;
     }
     header.innerHTML = `<div class="group-title">${groupName}</div>${sumHtml}`;
@@ -1840,18 +1919,31 @@ function renderTab() {
 
       let pfHtml = '';
       const pf = stock.portfolio;
-      if (pf && pf.shares > 0) {
+      if (pf && (pf.shares > 0 || pf.realizedPnl)) {
         const pCls = pf.pnl >= 0 ? 'up' : 'down';
         const pSign = pf.pnl >= 0 ? '+' : '-';
         if (pf.type === 'stock') {
-          pfHtml = `<div class="portfolio" onclick="openEdit('${stock.symbol}','${stock.label}',${pf.shares},${pf.cost})">
-            <span class="pf-label">我的持仓</span>
-            <span class="pf-item">持仓 <span class="pf-val">${pf.shares}股</span></span>
-            <span class="pf-item">成本 <span class="pf-val">${csym}${pf.cost.toFixed(2)}</span></span>
-            <span class="pf-item">市值 <span class="pf-val">${csym}${pf.mktVal.toFixed(0)}</span></span>
-            <span class="pf-pnl ${pCls}">${pSign}${csym}${Math.abs(pf.pnl).toFixed(2)} (${pSign}${Math.abs(pf.pnlPct).toFixed(2)}%)<span class="pf-delay">延迟</span></span>
-            <span class="pf-edit-hint">点击调整</span>
-          </div>`;
+          const rPnl = pf.realizedPnl || 0;
+          const rPnlPct = pf.realizedPnlPct || 0;
+          const rCls = rPnl >= 0 ? 'up' : 'down';
+          const rSign = rPnl >= 0 ? '+' : '-';
+          const rHtml = rPnl ? ` <span class="pf-item" style="border-left:1px solid rgba(255,255,255,0.08);padding-left:10px;margin-left:4px">已实现 <span class="pf-pnl ${rCls}" style="font-size:11px">${rSign}${csym}${Math.abs(rPnl).toFixed(2)}</span></span>` : '';
+          if (pf.shares > 0) {
+            pfHtml = `<div class="portfolio" onclick="openEdit('${stock.symbol}','${stock.label}',${pf.shares},${pf.cost})">
+              <span class="pf-label">我的持仓</span>
+              <span class="pf-item">持仓 <span class="pf-val">${pf.shares}股</span></span>
+              <span class="pf-item">成本 <span class="pf-val">${csym}${pf.cost.toFixed(2)}</span></span>
+              <span class="pf-item">市值 <span class="pf-val">${csym}${pf.mktVal.toFixed(0)}</span></span>
+              <span class="pf-pnl ${pCls}">${pSign}${csym}${Math.abs(pf.pnl).toFixed(2)} (${pSign}${Math.abs(pf.pnlPct).toFixed(2)}%)<span class="pf-delay">延迟</span></span>${rHtml}
+              <span class="pf-edit-hint">点击调整</span>
+            </div>`;
+          } else {
+            pfHtml = `<div class="portfolio" onclick="openEdit('${stock.symbol}','${stock.label}',0,${pf.cost})" style="background:linear-gradient(135deg,rgba(${rPnl>=0?'239,68,68':'34,197,94'},0.06),rgba(${rPnl>=0?'239,68,68':'34,197,94'},0.02));border-color:rgba(${rPnl>=0?'239,68,68':'34,197,94'},0.15)">
+              <span class="pf-label" style="color:var(--text-dim)">已清仓</span>
+              <span class="pf-pnl ${rCls}">已实现收益 ${rSign}${csym}${Math.abs(rPnl).toFixed(2)} (${rSign}${Math.abs(rPnlPct).toFixed(2)}%)</span>
+              <span class="pf-edit-hint">点击调整</span>
+            </div>`;
+          }
         }
       }
 
@@ -2186,6 +2278,8 @@ function updateStockPortfolioData(symbol, portfolio) {
     pnlPct: portfolio.pnlPct,
     purchases: portfolio.purchases || [],
     sales: portfolio.sales || [],
+    realizedPnl: portfolio.realizedPnl || 0,
+    realizedPnlPct: portfolio.realizedPnlPct || 0,
   };
 }
 
