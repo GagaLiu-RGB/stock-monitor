@@ -87,12 +87,24 @@ def compute_realized_pnl(purchases, sales):
 
     return round(realized, 2), round(sold_cost_basis, 2)
 
-# Backfill realized_pnl for portfolio entries that have sales but no realized_pnl yet
 def _backfill_realized_pnl():
+    """Recompute realized_pnl for any portfolio entry with sales, synthesizing
+    a purchase record from cost/shares when the purchases list is missing."""
     changed = False
     for sym, pf in PORTFOLIO.items():
-        if pf.get('sales') and 'realized_pnl' not in pf:
-            rpnl, sold_basis = compute_realized_pnl(pf.get('purchases', []), pf['sales'])
+        if not pf.get('sales'):
+            continue
+        purchases = list(pf.get('purchases', []))
+        if not purchases and pf.get('cost'):
+            total_bought = float(pf.get('shares', 0))
+            for s in pf['sales']:
+                total_bought += float(s.get('shares', 0))
+            if total_bought > 0:
+                purchases = [{"date": "", "shares": total_bought, "cost": float(pf['cost'])}]
+                pf['purchases'] = purchases
+                changed = True
+        rpnl, sold_basis = compute_realized_pnl(purchases, pf['sales'])
+        if rpnl != pf.get('realized_pnl', 0) or sold_basis != pf.get('sold_cost_basis', 0):
             pf['realized_pnl'] = rpnl
             pf['sold_cost_basis'] = sold_basis
             changed = True
@@ -777,6 +789,12 @@ def api_update_portfolio():
         sales.append({"date": sell_date, "shares": float(shares), "cost": sell_cost})
         new_shares = max(old["shares"] - float(shares), 0)
         purchases_list = list(old.get("purchases", []))
+        if not purchases_list and old.get("cost"):
+            total_bought = float(old.get("shares", 0))
+            for s in old_sales:
+                total_bought += float(s.get("shares", 0))
+            if total_bought > 0:
+                purchases_list = [{"date": "", "shares": total_bought, "cost": float(old["cost"])}]
         rpnl, sold_basis = compute_realized_pnl(purchases_list, sales)
         PORTFOLIO[symbol] = {
             "shares": round(new_shares, 4), "cost": old["cost"],
@@ -913,6 +931,173 @@ def api_update_portfolio():
             "realizedPnlPct": safe_float(rpp),
         },
         "current_price": safe_float(current_price),
+    })
+
+@app.route('/api/delete-transaction', methods=['POST'])
+def api_delete_transaction():
+    global TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS
+    d = request.get_json(force=True)
+    symbol = (d.get('symbol') or '').strip()
+    tx_type = d.get('type', '')  # 'buy' or 'sell'
+    index = d.get('index')
+
+    if not symbol or tx_type not in ('buy', 'sell') or index is None:
+        return jsonify({"error": "参数不完整"}), 400
+
+    pf = PORTFOLIO.get(symbol)
+    if not pf:
+        return jsonify({"error": f"{symbol} 无持仓数据"}), 404
+
+    index = int(index)
+    if tx_type == 'buy':
+        purchases = list(pf.get('purchases', []))
+        if index < 0 or index >= len(purchases):
+            return jsonify({"error": "索引越界"}), 400
+        purchases.pop(index)
+        pf['purchases'] = purchases
+    else:
+        sales = list(pf.get('sales', []))
+        if index < 0 or index >= len(sales):
+            return jsonify({"error": "索引越界"}), 400
+        sales.pop(index)
+        pf['sales'] = sales
+
+    purchases = pf.get('purchases', [])
+    sales = pf.get('sales', [])
+
+    total_bought = sum(float(p.get('shares', 0)) for p in purchases)
+    total_sold = sum(float(s.get('shares', 0)) for s in sales)
+    remaining = max(total_bought - total_sold, 0)
+
+    total_buy_cost = sum(float(p.get('shares', 0)) * float(p.get('cost', 0)) for p in purchases)
+    avg_cost = (total_buy_cost / total_bought) if total_bought > 0 else 0
+
+    rpnl, sold_basis = compute_realized_pnl(purchases, sales)
+
+    if not purchases and not sales:
+        PORTFOLIO.pop(symbol, None)
+    else:
+        pf['shares'] = round(remaining, 4)
+        pf['cost'] = round(avg_cost, 4)
+        pf['realized_pnl'] = rpnl
+        pf['sold_cost_basis'] = sold_basis
+        PORTFOLIO[symbol] = pf
+
+    # Auto-move between groups when shares change
+    moved = False
+    from_group = None
+    to_group = None
+    pf_shares = PORTFOLIO.get(symbol, {}).get("shares", 0)
+    symbol_exists = symbol in PORTFOLIO
+
+    for tab_name_m, groups_m in TABS.items():
+        found = False
+        for grp_name_m, stocks_m in groups_m.items():
+            if any(s[0] == symbol for s in stocks_m):
+                found = True
+                if pf_shares > 0 and '持仓' not in grp_name_m:
+                    pf_grp = next((g for g in groups_m if '持仓' in g), None)
+                    if not pf_grp:
+                        pf_grp = '我的持仓'
+                        new_groups = {pf_grp: []}
+                        new_groups.update(TABS[tab_name_m])
+                        TABS[tab_name_m] = new_groups
+                    stock_entry = next(s for s in stocks_m if s[0] == symbol)
+                    TABS[tab_name_m][grp_name_m] = [s for s in stocks_m if s[0] != symbol]
+                    TABS[tab_name_m][pf_grp].append(stock_entry)
+                    moved = True
+                    from_group = grp_name_m
+                    to_group = pf_grp
+                elif pf_shares <= 0 and '持仓' in grp_name_m and symbol_exists:
+                    watch_grp = next((g for g in groups_m if '持仓' not in g and '指数' not in g), None)
+                    if not watch_grp:
+                        watch_grp = '关注'
+                        TABS[tab_name_m][watch_grp] = []
+                    stock_entry = next(s for s in stocks_m if s[0] == symbol)
+                    TABS[tab_name_m][grp_name_m] = [s for s in stocks_m if s[0] != symbol]
+                    TABS[tab_name_m][watch_grp].append(stock_entry)
+                    moved = True
+                    from_group = grp_name_m
+                    to_group = watch_grp
+                break
+        if found:
+            break
+
+    save_config(TABS, PORTFOLIO, TAB_CURRENCY, DESCRIPTIONS)
+
+    # Update cache in-place
+    current_price = 0
+    pf_data = PORTFOLIO.get(symbol, {})
+    if cache["data"]:
+        for tab_name_c, tab_info in cache["data"].items():
+            groups_c = tab_info.get("groups", {})
+            stock_found = False
+            for grp_name_c, stocks_list in groups_c.items():
+                for idx_c, s in enumerate(stocks_list):
+                    if s.get("symbol") == symbol:
+                        stock_found = True
+                        current_price = s.get("price", 0)
+                        sh = pf_data.get("shares", 0)
+                        co = pf_data.get("cost", 0)
+                        mv = current_price * sh if sh > 0 else 0
+                        pl = (current_price - co) * sh if sh > 0 else 0
+                        pp = (current_price - co) / co * 100 if sh > 0 and co > 0 else 0
+                        rp = pf_data.get("realized_pnl", 0)
+                        sb = pf_data.get("sold_cost_basis", 0)
+                        rpp = (rp / sb * 100) if sb else 0
+                        if not purchases and not sales:
+                            s.pop("portfolio", None)
+                        else:
+                            s["portfolio"] = {
+                                "type": "stock", "shares": sh,
+                                "cost": round(co, 3),
+                                "mktVal": safe_float(mv),
+                                "pnl": safe_float(pl),
+                                "pnlPct": safe_float(pp),
+                                "purchases": pf_data.get("purchases", []),
+                                "sales": pf_data.get("sales", []),
+                                "realizedPnl": safe_float(rp),
+                                "realizedPnlPct": safe_float(rpp),
+                            }
+                        if moved and grp_name_c != to_group:
+                            stocks_list.pop(idx_c)
+                            if to_group not in groups_c:
+                                new_grps = {to_group: [s]}
+                                new_grps.update(groups_c)
+                                tab_info["groups"] = new_grps
+                            else:
+                                groups_c[to_group].append(s)
+                        break
+                if stock_found:
+                    break
+            if stock_found:
+                break
+
+    sh = pf_data.get("shares", 0)
+    co = pf_data.get("cost", 0)
+    mv = current_price * sh if sh > 0 else 0
+    pl = (current_price - co) * sh if sh > 0 else 0
+    pp = (current_price - co) / co * 100 if sh > 0 and co > 0 else 0
+    rp = pf_data.get("realized_pnl", 0)
+    sb = pf_data.get("sold_cost_basis", 0)
+    rpp = (rp / sb * 100) if sb else 0
+
+    return jsonify({
+        "ok": True,
+        "removed": not purchases and not sales,
+        "moved": moved,
+        "from_group": from_group,
+        "to_group": to_group,
+        "portfolio": {
+            "shares": sh, "cost": round(co, 3),
+            "purchases": pf_data.get("purchases", []),
+            "sales": pf_data.get("sales", []),
+            "mktVal": safe_float(mv),
+            "pnl": safe_float(pl),
+            "pnlPct": safe_float(pp),
+            "realizedPnl": safe_float(rp),
+            "realizedPnlPct": safe_float(rpp),
+        },
     })
 
 # ── HTML (self-contained) ──────────────────────────────
@@ -1202,10 +1387,18 @@ HTML_PAGE = r'''<!DOCTYPE html>
   .pos-sell-row { color: var(--down); }
   .pos-buy-row { color: var(--text); }
   .pos-purchase-row {
-    display: flex; justify-content: space-between; padding: 4px 0;
+    display: flex; justify-content: space-between; align-items: center; padding: 4px 0;
     border-bottom: 1px solid rgba(255,255,255,0.04);
   }
   .pos-purchase-row:last-child { border-bottom: none; }
+  .pos-del-btn {
+    width: 18px; height: 18px; border-radius: 4px; border: none;
+    background: transparent; color: #ef4444; font-size: 12px;
+    cursor: pointer; opacity: 0.5; transition: opacity 0.15s, background 0.15s;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; margin-left: 8px; line-height: 1; padding: 0;
+  }
+  .pos-del-btn:hover { opacity: 1; background: rgba(239,68,68,0.12); }
   .pos-total {
     margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);
     font-weight: 600; display: flex; justify-content: space-between;
@@ -1912,7 +2105,7 @@ function renderTab() {
     for (const st of stocks) {
       if (st.error || !st.portfolio) continue;
       const p = st.portfolio;
-      if (p.shares > 0 || p.realizedPnl) hasPf = true;
+      if (p.shares > 0 || p.realizedPnl || (p.sales && p.sales.length > 0)) hasPf = true;
       totalVal += p.mktVal || 0;
       totalPnl += p.pnl || 0;
       totalRealizedPnl += p.realizedPnl || 0;
@@ -1978,7 +2171,7 @@ function renderTab() {
 
       let pfHtml = '';
       const pf = stock.portfolio;
-      if (pf && (pf.shares > 0 || pf.realizedPnl)) {
+      if (pf && (pf.shares > 0 || pf.realizedPnl || (pf.sales && pf.sales.length > 0))) {
         const pCls = pf.pnl >= 0 ? 'up' : 'down';
         const pSign = pf.pnl >= 0 ? '+' : '-';
         if (pf.type === 'stock') {
@@ -2285,15 +2478,15 @@ function renderPosExisting() {
   let html = '';
 
   if (pf && pf.purchases && pf.purchases.length > 0) {
-    const buyRows = pf.purchases.map(p =>
-      '<div class="pos-purchase-row pos-buy-row"><span>' + p.date + '</span><span>买入 ' + p.shares + '股 × ' + p.cost.toFixed(2) + '</span></div>'
+    const buyRows = pf.purchases.map((p, i) =>
+      '<div class="pos-purchase-row pos-buy-row"><span>' + p.date + '</span><span>买入 ' + p.shares + '股 × ' + p.cost.toFixed(2) + '</span><button class="pos-del-btn" onclick="deleteTransaction(\'buy\',' + i + ')" title="删除此记录">✕</button></div>'
     ).join('');
     html += '<div class="pos-purchases"><div class="pos-purchases-title">买入记录</div><div class="pos-purchases-list">' + buyRows + '</div></div>';
   }
 
   if (pf && pf.sales && pf.sales.length > 0) {
-    const sellRows = pf.sales.map(p =>
-      '<div class="pos-purchase-row pos-sell-row"><span>' + p.date + '</span><span>卖出 ' + p.shares + '股 × ' + p.cost.toFixed(2) + '</span></div>'
+    const sellRows = pf.sales.map((p, i) =>
+      '<div class="pos-purchase-row pos-sell-row"><span>' + p.date + '</span><span>卖出 ' + p.shares + '股 × ' + p.cost.toFixed(2) + '</span><button class="pos-del-btn" onclick="deleteTransaction(\'sell\',' + i + ')" title="删除此记录">✕</button></div>'
     ).join('');
     html += '<div class="pos-purchases"><div class="pos-purchases-title">卖出记录</div><div class="pos-purchases-list">' + sellRows + '</div></div>';
   }
@@ -2354,6 +2547,53 @@ function moveStockInData(symbol, fromGroup, toGroup) {
         return;
       }
     }
+  }
+}
+
+async function deleteTransaction(type, index) {
+  const typeLabel = type === 'buy' ? '买入' : '卖出';
+  if (!confirm('确定删除这条' + typeLabel + '记录？')) return;
+
+  const msg = document.getElementById('pos-msg');
+  msg.className = 'msg';
+  msg.textContent = '';
+
+  try {
+    const resp = await fetch('/api/delete-transaction', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ symbol: positionSymbol, type, index })
+    });
+    const data = await resp.json();
+
+    if (!resp.ok || data.error) {
+      msg.className = 'msg err';
+      msg.textContent = data.error || '删除失败';
+      return;
+    }
+
+    msg.className = 'msg ok';
+    msg.textContent = '已删除';
+    setTimeout(() => { msg.className = 'msg'; msg.textContent = ''; }, 1500);
+
+    if (data.portfolio) {
+      updateStockPortfolioData(positionSymbol, data.portfolio);
+    }
+    if (data.removed) {
+      const stock = findStockData(positionSymbol);
+      if (stock) delete stock.portfolio;
+    }
+    if (data.moved) {
+      moveStockInData(positionSymbol, data.from_group, data.to_group);
+    }
+
+    await loadData();
+    renderPosExisting();
+    destroyCharts();
+    renderTab();
+  } catch(e) {
+    msg.className = 'msg err';
+    msg.textContent = '请求失败: ' + e.message;
   }
 }
 
